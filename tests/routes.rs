@@ -51,3 +51,25 @@ fn reserved_ui_route_is_501() {
     assert_eq!(status, 501, "body: {body}");
     assert!(body.contains("not_implemented"), "body: {body}");
 }
+
+#[test]
+fn malformed_json_body_is_400() {
+    let server = common::start(&config(common::free_port()));
+    let (status, body) = common::post_json(
+        &format!("{}/v1/chat/completions", server.base),
+        "{not valid json",
+    );
+    assert_eq!(status, 400, "body: {body}");
+    assert!(body.contains("parse_error"), "body: {body}");
+}
+
+#[test]
+fn empty_messages_is_400() {
+    let server = common::start(&config(common::free_port()));
+    let (status, body) = common::post_json(
+        &format!("{}/v1/chat/completions", server.base),
+        r#"{"model":"default","messages":[]}"#,
+    );
+    assert_eq!(status, 400, "body: {body}");
+    assert!(body.contains("missing_messages"), "body: {body}");
+}

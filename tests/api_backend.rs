@@ -1,5 +1,6 @@
 //! End-to-end coverage for the `api` backend: a mock OpenAI-compatible upstream
-//! over real TCP exercises build_body -> http_client::post_json -> extract_content.
+//! over real TCP exercises build_body -> http_client::post_json -> extract_content,
+//! including the non-2xx fallthrough path.
 mod common;
 
 use std::io::{Read, Write};
@@ -7,12 +8,9 @@ use std::net::TcpListener;
 use std::thread;
 
 /// Bind `port` and, on a background thread, answer exactly one HTTP request with
-/// a canned chat-completion whose content is `reply`. The listener binds before
-/// returning, so the upstream is reachable as soon as this function returns.
-fn spawn_mock_upstream(port: u16, reply: &str) -> thread::JoinHandle<()> {
-    let body = format!(
-        r#"{{"id":"mock","object":"chat.completion","choices":[{{"index":0,"message":{{"role":"assistant","content":"{reply}"}},"finish_reason":"stop"}}]}}"#
-    );
+/// the given raw `response`. The listener binds before returning, so the
+/// upstream is reachable as soon as this function returns.
+fn mock_upstream(port: u16, response: String) -> thread::JoinHandle<()> {
     let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind mock upstream");
     thread::spawn(move || {
         let Ok((mut sock, _)) = listener.accept() else {
@@ -49,21 +47,33 @@ fn spawn_mock_upstream(port: u16, reply: &str) -> thread::JoinHandle<()> {
                 }
             }
         }
-        let resp = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        let _ = sock.write_all(resp.as_bytes());
+        let _ = sock.write_all(response.as_bytes());
         let _ = sock.flush();
     })
+}
+
+fn http_response(status: u16, reason: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    )
+}
+
+fn completion_json(reply: &str) -> String {
+    format!(
+        r#"{{"id":"mock","object":"chat.completion","choices":[{{"index":0,"message":{{"role":"assistant","content":"{reply}"}},"finish_reason":"stop"}}]}}"#
+    )
 }
 
 #[test]
 fn api_backend_round_trips_through_mock_upstream() {
     let server_port = common::free_port();
     let mock_port = common::free_port();
-    let _mock = spawn_mock_upstream(mock_port, "pong-from-mock");
+    let _mock = mock_upstream(
+        mock_port,
+        http_response(200, "OK", &completion_json("pong-from-mock")),
+    );
 
     let cfg = format!(
         r#"
@@ -95,5 +105,52 @@ order = ["mockapi"]
     assert!(
         body.contains(r#""model":"mock-model""#),
         "pinned model label missing: {body}"
+    );
+}
+
+#[test]
+fn api_non_2xx_falls_through_to_next_backend() {
+    let server_port = common::free_port();
+    let mock_port = common::free_port();
+    // Upstream returns 500 -> api dispatch must surface Http error and the chain
+    // advances to the `echo` cli backend.
+    let _mock = mock_upstream(
+        mock_port,
+        http_response(500, "Internal Server Error", r#"{"error":"boom"}"#),
+    );
+
+    let cfg = format!(
+        r#"
+[server]
+listen = "127.0.0.1:{server_port}"
+default_chain = "viaapi"
+env_source = "process"
+
+[backends.mockapi]
+type = "api"
+base_url = "http://127.0.0.1:{mock_port}/v1"
+model = "mock-model"
+
+[backends.echo]
+type = "cli"
+bin = "/bin/echo"
+
+[chains.viaapi]
+order = ["mockapi", "echo"]
+"#
+    );
+    let server = common::start(&cfg);
+    let (status, body) = common::post_json(
+        &format!("{}/v1/chat/completions", server.base),
+        r#"{"model":"viaapi","messages":[{"role":"user","content":"fallback-marker-99"}]}"#,
+    );
+    assert_eq!(status, 200, "expected fallthrough to echo: {body}");
+    assert!(
+        body.contains("fallback-marker-99"),
+        "echoed content missing: {body}"
+    );
+    assert!(
+        body.contains(r#""model":"echo""#),
+        "served backend should be echo, not the failed api: {body}"
     );
 }
