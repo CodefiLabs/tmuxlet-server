@@ -1,6 +1,8 @@
 use super::{BackendError, DispatchResult, TmuxletBackend};
 use crate::env::Env;
-use std::time::Duration;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 /// Assemble the argv for `tmuxlet -p --target T --output-format json -C cwd
 /// --timeout S [--target-arg A ...] <prompt>`.
@@ -48,15 +50,71 @@ pub fn parse_output(name: &str, stdout: &str) -> Result<String, BackendError> {
     }
 }
 
-/// Spawn `tmuxlet` and return its output. STUB — implemented in Task 7
-/// (see docs/superpowers/plans/2026-05-28-tmuxlet-server.md).
+/// Spawn `tmuxlet`, draining stdout/stderr on threads, with a watchdog backstop
+/// (tmuxlet also self-limits via `--timeout`). Output is parsed by `parse_output`.
 pub fn dispatch(
-    _b: &TmuxletBackend,
-    _prompt: &str,
-    _env: &Env,
-    _timeout: Duration,
+    b: &TmuxletBackend,
+    prompt: &str,
+    env: &Env,
+    timeout: Duration,
 ) -> Result<DispatchResult, BackendError> {
-    todo!("Task 7: spawn tmuxlet with build_args + watchdog, then parse_output")
+    let args = build_args(b, prompt, timeout.as_secs());
+    let mut child = Command::new("tmuxlet")
+        .args(&args)
+        .env_clear()
+        .envs(env.as_pairs())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| BackendError::Spawn(b.name.clone(), e.to_string()))?;
+
+    let mut out = child.stdout.take().unwrap();
+    let mut err = child.stderr.take().unwrap();
+    let oh = thread::spawn(move || {
+        let mut s = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut out, &mut s);
+        s
+    });
+    let eh = thread::spawn(move || {
+        let mut s = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut err, &mut s);
+        s
+    });
+
+    // Server-side watchdog backstop; tmuxlet also self-limits via --timeout.
+    let deadline = Instant::now() + timeout + Duration::from_secs(5);
+    let status = loop {
+        match child
+            .try_wait()
+            .map_err(|e| BackendError::Spawn(b.name.clone(), e.to_string()))?
+        {
+            Some(s) => break s,
+            None => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(BackendError::Timeout(b.name.clone()));
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&oh.join().unwrap()).into_owned();
+    let stderr = String::from_utf8_lossy(&eh.join().unwrap()).into_owned();
+    if !status.success() && stdout.trim().is_empty() {
+        return Err(BackendError::Exit(
+            b.name.clone(),
+            status.code().unwrap_or(-1),
+            stderr.lines().last().unwrap_or("").to_string(),
+        ));
+    }
+    let content = parse_output(&b.name, &stdout)?;
+    Ok(DispatchResult {
+        content,
+        model_label: b.name.clone(),
+    })
 }
 
 #[cfg(test)]
