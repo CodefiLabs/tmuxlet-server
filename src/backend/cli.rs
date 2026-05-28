@@ -1,6 +1,9 @@
 use super::{BackendError, CliBackend, DispatchResult};
 use crate::env::Env;
-use std::time::Duration;
+use crate::pty;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 /// For a non-PTY CLI: the configured args with the prompt appended as the
 /// final positional argument.
@@ -10,17 +13,66 @@ pub fn plain_args(b: &CliBackend, prompt: &str) -> Vec<String> {
     a
 }
 
-/// Run the CLI backend (PTY or plain) and return cleaned output. STUB —
-/// implemented in Task 9 (see docs/superpowers/plans/2026-05-28-tmuxlet-server.md).
+/// Run the CLI backend and return cleaned output. `pty=true` runs the binary in
+/// a PTY (for TUI tools like agy); `pty=false` uses a plain piped child guarded
+/// by a try_wait watchdog. Either way the output is stripped of ANSI/control
+/// bytes via `pty::clean_output`.
 pub fn dispatch(
-    _b: &CliBackend,
-    _prompt: &str,
-    _env: &Env,
-    _timeout: Duration,
+    b: &CliBackend,
+    prompt: &str,
+    env: &Env,
+    timeout: Duration,
 ) -> Result<DispatchResult, BackendError> {
-    todo!(
-        "Task 9: pty::run_in_pty (pty=true) or Command::output (pty=false), then pty::clean_output"
-    )
+    let content = if b.pty {
+        let raw = pty::run_in_pty(
+            &b.bin.display().to_string(),
+            &b.args,
+            &env.as_pairs(),
+            &std::env::var("HOME").unwrap_or_else(|_| ".".into()),
+            prompt,
+            timeout,
+        )
+        .map_err(|e| BackendError::Spawn(b.name.clone(), e.to_string()))?;
+        pty::clean_output(&raw)
+    } else {
+        let mut child = Command::new(&b.bin)
+            .args(plain_args(b, prompt))
+            .env_clear()
+            .envs(env.as_pairs())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| BackendError::Spawn(b.name.clone(), e.to_string()))?;
+        let mut out = child.stdout.take().unwrap();
+        let oh = thread::spawn(move || {
+            let mut s = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut out, &mut s);
+            s
+        });
+        let deadline = Instant::now() + timeout;
+        loop {
+            match child
+                .try_wait()
+                .map_err(|e| BackendError::Spawn(b.name.clone(), e.to_string()))?
+            {
+                Some(_) => break,
+                None => {
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(BackendError::Timeout(b.name.clone()));
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+        pty::clean_output(&oh.join().unwrap())
+    };
+    Ok(DispatchResult {
+        content,
+        model_label: b.name.clone(),
+    })
 }
 
 #[cfg(test)]
