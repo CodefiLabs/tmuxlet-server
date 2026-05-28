@@ -73,3 +73,12 @@ fn empty_messages_is_400() {
     assert_eq!(status, 400, "body: {body}");
     assert!(body.contains("missing_messages"), "body: {body}");
 }
+
+#[test]
+fn reserved_api_and_root_are_501() {
+    let server = common::start(&config(common::free_port()));
+    let (api_status, _) = common::get(&format!("{}/api/sessions/1", server.base));
+    assert_eq!(api_status, 501, "/api/* should be reserved");
+    let (root_status, _) = common::get(&format!("{}/", server.base));
+    assert_eq!(root_status, 501, "/ should be reserved");
+}

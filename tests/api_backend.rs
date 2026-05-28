@@ -154,3 +154,70 @@ order = ["mockapi", "echo"]
         "served backend should be echo, not the failed api: {body}"
     );
 }
+
+/// Mock that echoes the received `Authorization: Bearer <token>` back as the
+/// completion content (or "NO-AUTH" if absent).
+fn mock_upstream_echo_auth(port: u16) -> thread::JoinHandle<()> {
+    let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind mock upstream");
+    thread::spawn(move || {
+        let Ok((mut sock, _)) = listener.accept() else {
+            return;
+        };
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            match sock.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                Err(_) => break,
+            }
+        }
+        let head = String::from_utf8_lossy(&buf);
+        let token = head
+            .lines()
+            .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
+            .and_then(|l| l.split_once(':').map(|x| x.1))
+            .map(|v| v.trim().trim_start_matches("Bearer ").trim().to_string())
+            .unwrap_or_else(|| "NO-AUTH".to_string());
+        let resp = http_response(200, "OK", &completion_json(&token));
+        let _ = sock.write_all(resp.as_bytes());
+        let _ = sock.flush();
+    })
+}
+
+#[test]
+fn api_backend_sends_bearer_from_api_key_env() {
+    let server_port = common::free_port();
+    let mock_port = common::free_port();
+    let _mock = mock_upstream_echo_auth(mock_port);
+
+    let cfg = format!(
+        r#"
+[server]
+listen = "127.0.0.1:{server_port}"
+default_chain = "viaapi"
+env_source = "process"
+
+[backends.mockapi]
+type = "api"
+base_url = "http://127.0.0.1:{mock_port}/v1"
+model = "mock-model"
+api_key_env = "TMUXLET_TEST_KEY"
+
+[chains.viaapi]
+order = ["mockapi"]
+"#
+    );
+    // api_key_env holds the env var NAME; the value is resolved from the
+    // server's captured environment and sent as a bearer token.
+    let server = common::start_with_env(&cfg, &[("TMUXLET_TEST_KEY", "secret-token-xyz")]);
+    let (status, body) = common::post_json(
+        &format!("{}/v1/chat/completions", server.base),
+        r#"{"model":"viaapi","messages":[{"role":"user","content":"hi"}]}"#,
+    );
+    assert_eq!(status, 200, "body: {body}");
+    assert!(
+        body.contains("secret-token-xyz"),
+        "bearer token from api_key_env was not forwarded: {body}"
+    );
+}

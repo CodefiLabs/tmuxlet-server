@@ -66,11 +66,37 @@ pub fn post_json(url: &str, body: &str) -> (u16, String) {
     }
 }
 
+/// POST returning (status, content_type, body) — for asserting SSE headers.
+pub fn post_collect(url: &str, body: &str) -> (u16, String, String) {
+    let grab = |resp: ureq::Response| {
+        let ct = resp.header("Content-Type").unwrap_or("").to_string();
+        (resp.status(), ct, resp.into_string().unwrap_or_default())
+    };
+    match agent()
+        .post(url)
+        .set("Content-Type", "application/json")
+        .send_string(body)
+    {
+        Ok(resp) => grab(resp),
+        Err(ureq::Error::Status(code, resp)) => {
+            let (_, ct, b) = grab(resp);
+            (code, ct, b)
+        }
+        Err(e) => panic!("POST {url} failed (transport error): {e}"),
+    }
+}
+
 /// Write `config_toml` to a temp file, spawn the binary against it, and poll
 /// `/health` until it answers 200 (or panic after ~5s). `config_toml` MUST
 /// contain a `listen = "127.0.0.1:PORT"` line. Test configs should set
 /// `env_source = "process"` to skip the ~1s interactive-shell env capture.
 pub fn start(config_toml: &str) -> Server {
+    start_with_env(config_toml, &[])
+}
+
+/// Like `start`, but injects extra environment variables into the spawned
+/// server process (visible to backends when `env_source = "process"`).
+pub fn start_with_env(config_toml: &str, env: &[(&str, &str)]) -> Server {
     let dir = tempfile::tempdir().unwrap();
     let cfgp = dir.path().join("server.toml");
     std::fs::write(&cfgp, config_toml).unwrap();
@@ -87,6 +113,7 @@ pub fn start(config_toml: &str) -> Server {
     let child = Command::new(env!("CARGO_BIN_EXE_tmuxlet-server"))
         .arg("--config")
         .arg(&cfgp)
+        .envs(env.iter().copied())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
