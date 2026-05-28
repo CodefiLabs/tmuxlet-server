@@ -122,7 +122,7 @@ impl Backend {
     ) -> Result<DispatchResult, BackendError> {
         match self {
             Backend::Tmuxlet(b) => tmuxlet::dispatch(b, prompt, env, timeout),
-            Backend::Api(b) => api::dispatch(b, raw_messages, env),
+            Backend::Api(b) => api::dispatch(b, raw_messages, env, timeout),
             Backend::Cli(b) => cli::dispatch(b, prompt, env, timeout),
         }
     }

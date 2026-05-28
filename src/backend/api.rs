@@ -1,6 +1,7 @@
 use super::{ApiBackend, BackendError, DispatchResult};
 use crate::env::Env;
 use crate::http_client;
+use std::time::Duration;
 
 /// Split a base_url into (scheme, host, port, path).
 pub fn split_url(base_url: &str) -> (String, String, u16, String) {
@@ -57,6 +58,7 @@ pub fn dispatch(
     b: &ApiBackend,
     raw_messages: &serde_json::Value,
     env: &Env,
+    timeout: Duration,
 ) -> Result<DispatchResult, BackendError> {
     let (scheme, host, port, base_path) = split_url(&b.base_url);
     let path = format!("{}/chat/completions", base_path.trim_end_matches('/'));
@@ -65,9 +67,16 @@ pub fn dispatch(
         .api_key_env
         .as_ref()
         .and_then(|k| env.get(k).map(str::to_string));
-    let (status, resp) =
-        http_client::post_json(&scheme, &host, port, &path, bearer.as_deref(), &body)
-            .map_err(|e| BackendError::Spawn(b.name.clone(), e.to_string()))?;
+    let (status, resp) = http_client::post_json(
+        &scheme,
+        &host,
+        port,
+        &path,
+        bearer.as_deref(),
+        &body,
+        timeout,
+    )
+    .map_err(|e| BackendError::Spawn(b.name.clone(), e.to_string()))?;
     if !(200..300).contains(&status) {
         return Err(BackendError::Http(b.name.clone(), status));
     }
