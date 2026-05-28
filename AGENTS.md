@@ -7,11 +7,11 @@ Follow these steps in order. Each step has a precondition, a command, an
 expected outcome, and a verification you must run before moving on. Do not ask
 the user questions you can answer by running a command.
 
-> **Status:** V1 scaffold. The three backend `dispatch` functions
-> (`src/backend/{tmuxlet,api,cli}.rs`) are `todo!()` stubs until the
-> implementation plan at `docs/superpowers/plans/2026-05-28-tmuxlet-server.md`
-> (Tasks 7–9) is executed. `/health` and `/v1/models` already work; chat
-> requests will panic until those tasks land.
+> **Status:** V1 complete. All three backend `dispatch` functions
+> (`src/backend/{tmuxlet,api,cli}.rs`) are implemented and tested; `/health`,
+> `/v1/models`, and `/v1/chat/completions` (streaming and non-streaming) all
+> work. See the implementation plan at
+> `docs/superpowers/plans/2026-05-28-tmuxlet-server.md` for design details.
 
 ## Step 1: Verify prerequisites
 
