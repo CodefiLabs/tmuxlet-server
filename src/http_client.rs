@@ -44,19 +44,20 @@ fn request_bytes(host: &str, port: u16, path: &str, bearer: Option<&str>, body: 
 /// socket operation can block indefinitely. A zero `timeout` means "no
 /// read/write deadline" (connect is still clamped to a sane window).
 fn connect(host: &str, port: u16, timeout: Duration) -> io::Result<TcpStream> {
-    let addr = (host, port)
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::AddrNotAvailable,
-                format!("cannot resolve {host}:{port}"),
-            )
-        })?;
+    let addr = (host, port).to_socket_addrs()?.next().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            format!("cannot resolve {host}:{port}"),
+        )
+    })?;
     // connect_timeout rejects a zero duration; clamp to a sane window.
     let connect_to = timeout.clamp(Duration::from_secs(1), Duration::from_secs(15));
     let tcp = TcpStream::connect_timeout(&addr, connect_to)?;
-    let rw = if timeout.is_zero() { None } else { Some(timeout) };
+    let rw = if timeout.is_zero() {
+        None
+    } else {
+        Some(timeout)
+    };
     tcp.set_read_timeout(rw)?;
     tcp.set_write_timeout(rw)?;
     Ok(tcp)
