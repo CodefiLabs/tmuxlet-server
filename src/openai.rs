@@ -9,7 +9,11 @@ pub struct ChatRequest {
     pub messages: Vec<ChatMessage>,
     #[serde(default)]
     pub stream: bool,
+    // Captures arbitrary extra OpenAI params so they parse without error. The
+    // api backend forwards the verbatim request JSON (see http.rs), so this
+    // typed copy is intentionally not read in production code.
     #[serde(flatten)]
+    #[allow(dead_code)]
     pub extra: HashMap<String, serde_json::Value>,
 }
 
@@ -17,7 +21,10 @@ pub struct ChatRequest {
 pub struct ChatMessage {
     pub role: String,
     pub content: MessageContent,
+    // OpenAI per-message `name`; parsed for request-shape completeness but not
+    // used when flattening messages to a single prompt.
     #[serde(default)]
+    #[allow(dead_code)]
     pub name: Option<String>,
 }
 

@@ -1,11 +1,3 @@
-// Scaffold note: `dead_code` is allowed crate-wide because the per-backend
-// `dispatch` functions are `todo!()` stubs (see the plan at
-// docs/superpowers/plans/2026-05-28-tmuxlet-server.md, Tasks 7-9). The helper
-// functions they will call (build_args, post_json, run_in_pty, ...) are already
-// implemented and tested but not yet wired in. Remove this allow once Tasks 7-9
-// land.
-#![allow(dead_code)]
-
 mod backend;
 mod config;
 mod env;

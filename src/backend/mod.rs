@@ -102,6 +102,9 @@ impl Backend {
         }
     }
 
+    /// The backend's configured name. Exercised by tests; redundant with the
+    /// router-resolved name in production logging.
+    #[allow(dead_code)]
     pub fn name(&self) -> &str {
         match self {
             Backend::Tmuxlet(b) => &b.name,

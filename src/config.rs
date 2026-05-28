@@ -22,7 +22,9 @@ pub struct Server {
     pub request_timeout_secs: u64,
     #[serde(default = "default_env_source")]
     pub env_source: String,
+    // Accepted for forward-compat; V1 logging is unleveled (plain eprintln).
     #[serde(default = "default_log_level")]
+    #[allow(dead_code)]
     pub log_level: String,
 }
 
