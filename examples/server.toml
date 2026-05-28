@@ -1,0 +1,50 @@
+# tmuxlet-server example config. Default path: ~/.tmuxlet/server.toml
+# Override with: tmuxlet-server --config FILE
+
+[server]
+listen = "127.0.0.1:3456"
+default_chain = "default"
+request_timeout_secs = 1800          # server-wide default; tmuxlet/cli coding turns run minutes
+# env_source = "shell" runs `$SHELL -ilc env` at startup (~1s with a heavy
+# interactive zsh) so PATH entries exported in ~/.zshrc (e.g. agy) are visible
+# to spawned backends. Use "process" to skip that and inherit the current env.
+env_source = "shell"
+log_level = "info"                   # trace | info | warn | error
+
+# ── Backends ────────────────────────────────────────────────────────────────
+
+[backends.agy]
+type = "cli"
+bin = "/Users/kk/.antigravity/antigravity/bin/agy"   # NOTE: a symlink into Antigravity.app — must be installed
+args = ["-p"]
+pty = true                           # agy detects non-TTY and redirects output; needs a PTY
+
+[backends.ollama-kimi]
+type = "api"
+base_url = "http://127.0.0.1:11434/v1"
+model = "kimi-k2.6:cloud"
+extra_body = { think = true }        # shallow-merged into the request body
+timeout_secs = 120                   # api backends can fail fast
+
+[backends.openrouter-sonnet]
+type = "api"
+base_url = "https://openrouter.ai/api/v1"
+model = "anthropic/claude-sonnet-4.6"
+api_key_env = "OPENROUTER_API_KEY"   # env var NAME, not the key itself
+timeout_secs = 120
+
+[backends.claude-thinking]
+type = "tmuxlet"
+target = "claude"
+target_args = ["--effort", "max"]    # passed through as repeated --target-arg
+cwd = "~"
+
+# ── Chains ──────────────────────────────────────────────────────────────────
+# Ordered fallback lists. The request `model` selects a chain or a single
+# backend; anything unmatched falls back to server.default_chain.
+
+[chains.default]
+order = ["agy", "ollama-kimi", "claude-thinking"]
+
+[chains.thinking]
+order = ["claude-thinking", "agy"]

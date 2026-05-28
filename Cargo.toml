@@ -1,0 +1,21 @@
+[package]
+name = "tmuxlet-server"
+version = "0.1.0"
+edition = "2024"
+description = "OpenAI-compatible HTTP server fronting tmuxlet, CLI tools, and API upstreams via a configurable fallback chain"
+license = "MIT"
+repository = "https://github.com/CodefiLabs/tmuxlet-server"
+
+[[bin]]
+name = "tmuxlet-server"
+path = "src/main.rs"
+
+[dependencies]
+tiny_http = "0.12"
+ctrlc = { version = "3.4", features = ["termination"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+toml = "1.1"
+rustls = { version = "0.23.40", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+webpki-roots = "1.0.7"
+portable-pty = "0.9.0"

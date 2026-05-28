@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS LaunchAgent for tmuxlet-server.
+  Install:
+    cp examples/launchagent.plist ~/Library/LaunchAgents/com.codefilabs.tmuxlet-server.plist
+    # edit the paths below for your username, then:
+    launchctl load ~/Library/LaunchAgents/com.codefilabs.tmuxlet-server.plist
+  Verify:
+    launchctl list | grep tmuxlet-server
+
+  Note: with env_source = "shell" the server runs `$SHELL -ilc env` at startup
+  to inherit your full interactive PATH (e.g. for agy), so only SHELL and a
+  minimal PATH are needed here.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.codefilabs.tmuxlet-server</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/kk/.cargo/bin/tmuxlet-server</string>
+        <string>--config</string>
+        <string>/Users/kk/.tmuxlet/server.toml</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>SHELL</key>
+        <string>/bin/zsh</string>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/Users/kk/.cargo/bin</string>
+        <key>HOME</key>
+        <string>/Users/kk</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/kk/Library/Logs/tmuxlet-server.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/kk/Library/Logs/tmuxlet-server.log</string>
+</dict>
+</plist>

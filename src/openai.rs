@@ -1,0 +1,306 @@
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+// ---------- Request ----------
+#[derive(Debug, Deserialize)]
+pub struct ChatRequest {
+    pub model: String,
+    pub messages: Vec<ChatMessage>,
+    #[serde(default)]
+    pub stream: bool,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ChatMessage {
+    pub role: String,
+    pub content: MessageContent,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum MessageContent {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+pub enum ContentPart {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(other)]
+    Other,
+}
+
+fn content_to_text(c: &MessageContent) -> String {
+    match c {
+        MessageContent::Text(s) => s.clone(),
+        MessageContent::Parts(ps) => ps
+            .iter()
+            .filter_map(|p| match p {
+                ContentPart::Text { text } => Some(text.as_str()),
+                ContentPart::Other => None,
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+    }
+}
+
+pub fn flatten_to_prompt(messages: &[ChatMessage]) -> String {
+    let mut blocks = Vec::with_capacity(messages.len());
+    for m in messages {
+        let label = match m.role.as_str() {
+            "system" => "[System]".to_string(),
+            "user" => "User".to_string(),
+            "assistant" => "Assistant".to_string(),
+            other => {
+                let mut c = other.chars();
+                match c.next() {
+                    Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                    None => String::new(),
+                }
+            }
+        };
+        blocks.push(format!("{}: {}", label, content_to_text(&m.content)));
+    }
+    blocks.join("\n\n")
+}
+
+// ---------- Non-streaming response ----------
+#[derive(Debug, Serialize)]
+pub struct ChatCompletion {
+    pub id: String,
+    pub object: &'static str,
+    pub created: u64,
+    pub model: String,
+    pub choices: Vec<Choice>,
+    pub usage: Usage,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Choice {
+    pub index: u32,
+    pub message: ResponseMessage,
+    pub finish_reason: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ResponseMessage {
+    pub role: &'static str,
+    pub content: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Usage {
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    pub total_tokens: u32,
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+pub fn build_completion(id: String, model: String, content: String) -> ChatCompletion {
+    ChatCompletion {
+        id,
+        object: "chat.completion",
+        created: unix_now(),
+        model,
+        choices: vec![Choice {
+            index: 0,
+            message: ResponseMessage {
+                role: "assistant",
+                content,
+            },
+            finish_reason: "stop".into(),
+        }],
+        usage: Usage {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+        },
+    }
+}
+
+// ---------- Streaming ----------
+#[derive(Debug, Serialize)]
+pub struct ChatChunk {
+    pub id: String,
+    pub object: &'static str,
+    pub created: u64,
+    pub model: String,
+    pub choices: Vec<ChunkChoice>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChunkChoice {
+    pub index: u32,
+    pub delta: Delta,
+    pub finish_reason: Option<String>,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct Delta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+}
+
+/// V1 buffered streaming: role-prime, one content frame, final, then [DONE].
+pub fn stream_frames(id: &str, model: &str, content: &str) -> Vec<String> {
+    let created = unix_now();
+    let frame = |c: ChunkChoice| {
+        let chunk = ChatChunk {
+            id: id.into(),
+            object: "chat.completion.chunk",
+            created,
+            model: model.into(),
+            choices: vec![c],
+        };
+        format!("data: {}\n\n", serde_json::to_string(&chunk).unwrap())
+    };
+    vec![
+        frame(ChunkChoice {
+            index: 0,
+            delta: Delta {
+                role: Some("assistant"),
+                content: Some(String::new()),
+            },
+            finish_reason: None,
+        }),
+        frame(ChunkChoice {
+            index: 0,
+            delta: Delta {
+                role: None,
+                content: Some(content.to_string()),
+            },
+            finish_reason: None,
+        }),
+        frame(ChunkChoice {
+            index: 0,
+            delta: Delta {
+                role: None,
+                content: None,
+            },
+            finish_reason: Some("stop".into()),
+        }),
+        "data: [DONE]\n\n".to_string(),
+    ]
+}
+
+// ---------- /v1/models ----------
+#[derive(Debug, Serialize)]
+pub struct ModelList {
+    pub object: &'static str,
+    pub data: Vec<ModelInfo>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ModelInfo {
+    pub id: String,
+    pub object: &'static str,
+    pub created: u64,
+    pub owned_by: String,
+}
+
+pub fn model_list(ids: impl Iterator<Item = String>) -> ModelList {
+    let created = unix_now();
+    ModelList {
+        object: "list",
+        data: ids
+            .map(|id| ModelInfo {
+                id,
+                object: "model",
+                created,
+                owned_by: "tmuxlet-server".into(),
+            })
+            .collect(),
+    }
+}
+
+// ---------- Errors ----------
+#[derive(Debug, Serialize)]
+pub struct ErrorEnvelope {
+    pub error: ApiError,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ApiError {
+    pub message: String,
+    #[serde(rename = "type")]
+    pub error_type: String,
+    pub param: Option<String>,
+    pub code: Option<String>,
+}
+
+impl ErrorEnvelope {
+    pub fn new(message: impl Into<String>, error_type: &str, code: Option<&str>) -> Self {
+        ErrorEnvelope {
+            error: ApiError {
+                message: message.into(),
+                error_type: error_type.into(),
+                param: None,
+                code: code.map(|s| s.to_string()),
+            },
+        }
+    }
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_string_and_array_content() {
+        let s =
+            r#"{"model":"x","messages":[{"role":"user","content":"hi"}],"stream":true,"seed":42}"#;
+        let p =
+            r#"{"model":"x","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}"#;
+        let a: ChatRequest = serde_json::from_str(s).unwrap();
+        let b: ChatRequest = serde_json::from_str(p).unwrap();
+        assert!(a.stream);
+        assert!(!b.stream);
+        assert!(a.extra.contains_key("seed"));
+    }
+
+    #[test]
+    fn flattens_messages_with_role_labels() {
+        let req: ChatRequest = serde_json::from_str(
+            r#"{"model":"x","messages":[{"role":"system","content":"S"},{"role":"user","content":"U"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(flatten_to_prompt(&req.messages), "[System]: S\n\nUser: U");
+    }
+
+    #[test]
+    fn final_stream_delta_serializes_empty() {
+        let frames = stream_frames("id1", "agy", "Hello");
+        assert_eq!(frames.len(), 4);
+        assert!(frames[0].contains(r#""role":"assistant""#));
+        assert!(frames[1].contains(r#""content":"Hello""#));
+        assert!(frames[2].contains(r#""delta":{}"#));
+        assert!(frames[2].contains(r#""finish_reason":"stop""#));
+        assert_eq!(frames[3], "data: [DONE]\n\n");
+    }
+
+    #[test]
+    fn completion_has_usage_object() {
+        let c = build_completion("id1".into(), "agy".into(), "hi".into());
+        let j = serde_json::to_string(&c).unwrap();
+        assert!(j.contains(r#""object":"chat.completion""#));
+        assert!(j.contains(r#""usage""#));
+    }
+}

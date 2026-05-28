@@ -1,0 +1,27 @@
+# systemd user unit for tmuxlet-server (Linux).
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp examples/tmuxlet-server.service ~/.config/systemd/user/
+#   # edit ExecStart / Environment for your paths, then:
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now tmuxlet-server
+# Verify:
+#   systemctl --user status tmuxlet-server
+#   journalctl --user -u tmuxlet-server -f
+
+[Unit]
+Description=tmuxlet-server (OpenAI-compatible fallback-chain proxy)
+After=network.target
+
+[Service]
+Type=simple
+# env_source = "shell" makes the server run `$SHELL -ilc env` at startup, so the
+# minimal Environment below is enough; SHELL must be set for that to work.
+Environment=SHELL=/bin/bash
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:%h/.cargo/bin
+ExecStart=%h/.cargo/bin/tmuxlet-server --config %h/.tmuxlet/server.toml
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
