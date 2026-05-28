@@ -1,5 +1,6 @@
 use super::{ApiBackend, BackendError, DispatchResult};
 use crate::env::Env;
+use crate::http_client;
 
 /// Split a base_url into (scheme, host, port, path).
 pub fn split_url(base_url: &str) -> (String, String, u16, String) {
@@ -49,14 +50,32 @@ pub fn extract_content(name: &str, resp: &str) -> Result<String, BackendError> {
         .ok_or_else(|| BackendError::Parse(name.into(), "no choices[0].message.content".into()))
 }
 
-/// Forward to an OpenAI-compatible HTTP upstream. STUB — implemented in Task 8
-/// (see docs/superpowers/plans/2026-05-28-tmuxlet-server.md).
+/// Forward to an OpenAI-compatible HTTP upstream: build the merged body, POST
+/// it, then re-extract `choices[0].message.content`. Non-2xx becomes an Http
+/// error so the chain falls through to the next backend.
 pub fn dispatch(
-    _b: &ApiBackend,
-    _raw_messages: &serde_json::Value,
-    _env: &Env,
+    b: &ApiBackend,
+    raw_messages: &serde_json::Value,
+    env: &Env,
 ) -> Result<DispatchResult, BackendError> {
-    todo!("Task 8: split_url + build_body -> http_client::post_json -> extract_content")
+    let (scheme, host, port, base_path) = split_url(&b.base_url);
+    let path = format!("{}/chat/completions", base_path.trim_end_matches('/'));
+    let body = build_body(raw_messages, &b.extra_body, &b.model).to_string();
+    let bearer = b
+        .api_key_env
+        .as_ref()
+        .and_then(|k| env.get(k).map(str::to_string));
+    let (status, resp) =
+        http_client::post_json(&scheme, &host, port, &path, bearer.as_deref(), &body)
+            .map_err(|e| BackendError::Spawn(b.name.clone(), e.to_string()))?;
+    if !(200..300).contains(&status) {
+        return Err(BackendError::Http(b.name.clone(), status));
+    }
+    let content = extract_content(&b.name, &resp)?;
+    Ok(DispatchResult {
+        content,
+        model_label: b.model.clone(),
+    })
 }
 
 #[cfg(test)]
