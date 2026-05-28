@@ -71,15 +71,17 @@ pub fn dispatch(
 
     let mut out = child.stdout.take().unwrap();
     let mut err = child.stderr.take().unwrap();
-    let oh = thread::spawn(move || {
+    let (otx, orx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
         let mut s = Vec::new();
         let _ = std::io::Read::read_to_end(&mut out, &mut s);
-        s
+        let _ = otx.send(s);
     });
-    let eh = thread::spawn(move || {
+    let (etx, erx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
         let mut s = Vec::new();
         let _ = std::io::Read::read_to_end(&mut err, &mut s);
-        s
+        let _ = etx.send(s);
     });
 
     // Server-side watchdog backstop; tmuxlet also self-limits via --timeout.
@@ -101,8 +103,12 @@ pub fn dispatch(
         }
     };
 
-    let stdout = String::from_utf8_lossy(&oh.join().unwrap()).into_owned();
-    let stderr = String::from_utf8_lossy(&eh.join().unwrap()).into_owned();
+    // Bounded collection: the child has exited, but a grandchild that inherited
+    // the pipe could keep it open. Don't block the worker forever on read_to_end;
+    // give the drained output a short grace window, then move on.
+    let grace = Duration::from_secs(5);
+    let stdout = String::from_utf8_lossy(&orx.recv_timeout(grace).unwrap_or_default()).into_owned();
+    let stderr = String::from_utf8_lossy(&erx.recv_timeout(grace).unwrap_or_default()).into_owned();
     if !status.success() && stdout.trim().is_empty() {
         return Err(BackendError::Exit(
             b.name.clone(),

@@ -131,14 +131,31 @@ pub fn handle(mut req: Request, state: &Arc<State>) {
             Some("unknown_route"),
         ),
         Route::Chat => {
+            // Cap the body read so a malformed/huge payload can't exhaust memory
+            // (loopback-only by convention, but bound it regardless).
+            const MAX_BODY: u64 = 16 * 1024 * 1024; // 16 MiB
             let mut raw = String::new();
-            if req.as_reader().read_to_string(&mut raw).is_err() {
+            if req
+                .as_reader()
+                .take(MAX_BODY + 1)
+                .read_to_string(&mut raw)
+                .is_err()
+            {
                 return respond_err(
                     req,
                     400,
                     "could not read body",
                     "invalid_request_error",
                     Some("read_error"),
+                );
+            }
+            if raw.len() as u64 > MAX_BODY {
+                return respond_err(
+                    req,
+                    413,
+                    "request body too large",
+                    "invalid_request_error",
+                    Some("payload_too_large"),
                 );
             }
             handle_chat(req, &raw, state);

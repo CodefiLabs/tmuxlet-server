@@ -46,15 +46,17 @@ pub fn dispatch(
             .map_err(|e| BackendError::Spawn(b.name.clone(), e.to_string()))?;
         let mut out = child.stdout.take().unwrap();
         let mut err = child.stderr.take().unwrap();
-        let oh = thread::spawn(move || {
+        let (otx, orx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
             let mut s = Vec::new();
             let _ = std::io::Read::read_to_end(&mut out, &mut s);
-            s
+            let _ = otx.send(s);
         });
-        let eh = thread::spawn(move || {
+        let (etx, erx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
             let mut s = Vec::new();
             let _ = std::io::Read::read_to_end(&mut err, &mut s);
-            s
+            let _ = etx.send(s);
         });
         let deadline = Instant::now() + timeout;
         let status = loop {
@@ -73,8 +75,12 @@ pub fn dispatch(
                 }
             }
         };
-        let cleaned = pty::clean_output(&oh.join().unwrap());
-        let stderr = String::from_utf8_lossy(&eh.join().unwrap()).into_owned();
+        // Bounded collection (see tmuxlet backend): a grandchild holding the
+        // pipe must not block the worker forever after the child has exited.
+        let grace = Duration::from_secs(5);
+        let cleaned = pty::clean_output(&orx.recv_timeout(grace).unwrap_or_default());
+        let stderr =
+            String::from_utf8_lossy(&erx.recv_timeout(grace).unwrap_or_default()).into_owned();
         // A non-zero exit with no usable stdout is a failure, so the fallback
         // chain advances to the next backend (mirrors the tmuxlet backend).
         if !status.success() && cleaned.trim().is_empty() {

@@ -62,10 +62,10 @@ pub fn run_in_pty(
         let _ = out_tx.send(collected);
     });
 
-    let _ = write!(writer, "{prompt}");
-    let _ = writer.flush();
-    drop(writer); // send EOF on the child's stdin.
-
+    // Arm the watchdog BEFORE writing the prompt: writing to the PTY master can
+    // block if the child (e.g. a TUI that doesn't drain stdin) lets the tty
+    // input buffer fill. If that write stalls past the timeout, the watchdog
+    // kills the child, which closes the PTY and unblocks the write.
     let (done_tx, done_rx) = mpsc::channel::<()>();
     let watchdog = thread::spawn(move || match done_rx.recv_timeout(timeout) {
         Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {}
@@ -73,6 +73,10 @@ pub fn run_in_pty(
             let _ = killer.kill();
         }
     });
+
+    let _ = write!(writer, "{prompt}");
+    let _ = writer.flush();
+    drop(writer); // send EOF on the child's stdin.
 
     let _ = child.wait().map_err(stringify)?;
     let _ = done_tx.send(());
