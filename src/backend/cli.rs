@@ -45,18 +45,24 @@ pub fn dispatch(
             .spawn()
             .map_err(|e| BackendError::Spawn(b.name.clone(), e.to_string()))?;
         let mut out = child.stdout.take().unwrap();
+        let mut err = child.stderr.take().unwrap();
         let oh = thread::spawn(move || {
             let mut s = Vec::new();
             let _ = std::io::Read::read_to_end(&mut out, &mut s);
             s
         });
+        let eh = thread::spawn(move || {
+            let mut s = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut err, &mut s);
+            s
+        });
         let deadline = Instant::now() + timeout;
-        loop {
+        let status = loop {
             match child
                 .try_wait()
                 .map_err(|e| BackendError::Spawn(b.name.clone(), e.to_string()))?
             {
-                Some(_) => break,
+                Some(s) => break s,
                 None => {
                     if Instant::now() >= deadline {
                         let _ = child.kill();
@@ -66,8 +72,19 @@ pub fn dispatch(
                     thread::sleep(Duration::from_millis(50));
                 }
             }
+        };
+        let cleaned = pty::clean_output(&oh.join().unwrap());
+        let stderr = String::from_utf8_lossy(&eh.join().unwrap()).into_owned();
+        // A non-zero exit with no usable stdout is a failure, so the fallback
+        // chain advances to the next backend (mirrors the tmuxlet backend).
+        if !status.success() && cleaned.trim().is_empty() {
+            return Err(BackendError::Exit(
+                b.name.clone(),
+                status.code().unwrap_or(-1),
+                stderr.lines().last().unwrap_or("").to_string(),
+            ));
         }
-        pty::clean_output(&oh.join().unwrap())
+        cleaned
     };
     Ok(DispatchResult {
         content,
