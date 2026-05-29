@@ -18,11 +18,16 @@ chain in order until one succeeds.
 ## Install
 
 ```
-cargo install --git https://github.com/CodefiLabs/tmuxlet-server --force
+cargo install --git https://github.com/CodefiLabs/tmuxlet-server --locked --force
 cp examples/server.toml ~/.tmuxlet/server.toml   # then edit
 tmuxlet-server --validate
 tmuxlet-server                                    # serve on 127.0.0.1:3456
 ```
+
+`--locked` is required: it installs the dependency versions pinned in this
+repo's `Cargo.lock`. Without it, Cargo resolves to the latest semver-compatible
+releases, and `dispatch2 0.3.1` (pulled in transitively by `ctrlc` on macOS)
+fails to compile with a `recursion limit reached` macro error.
 
 For step-by-step install + service setup + verification, see
 [`AGENTS.md`](./AGENTS.md). Example config: [`examples/server.toml`](./examples/server.toml).
@@ -53,10 +58,13 @@ Synchronous (no tokio). Direct deps: `tiny_http`, `ctrlc`, `serde`,
 
 ## Status
 
-V1 scaffold: pure logic, config, routing, the `rustls` HTTP client, and the
-`portable-pty` runner are implemented and tested (`cargo test` → green). The
-three backend `dispatch` entry points are stubbed pending the implementation
-plan in [`docs/superpowers/plans/2026-05-28-tmuxlet-server.md`](./docs/superpowers/plans/2026-05-28-tmuxlet-server.md).
+**V1 complete.** All three backend `dispatch` functions
+(`src/backend/{tmuxlet,api,cli}.rs`) are implemented and tested; `/health`,
+`/v1/models`, and `/v1/chat/completions` (streaming and non-streaming) all work,
+as does the fallback chain. CI (`fmt + clippy + test`) is green on macOS and
+Linux. See [`docs/STATUS.md`](./docs/STATUS.md) for the verification summary and
+[`docs/superpowers/plans/2026-05-28-tmuxlet-server.md`](./docs/superpowers/plans/2026-05-28-tmuxlet-server.md)
+for the design.
 
 ## License
 

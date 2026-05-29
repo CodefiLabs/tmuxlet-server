@@ -32,11 +32,14 @@ If a prerequisite is missing, STOP and tell the user which to install.
 ## Step 2: Install
 
 ```
-cargo install --git https://github.com/CodefiLabs/tmuxlet-server --force
+cargo install --git https://github.com/CodefiLabs/tmuxlet-server --locked --force
 tmuxlet-server --version
 ```
 Expected: prints `tmuxlet-server <version>`. If not, the `cargo install` failed —
-read its output.
+read its output. **`--locked` is required**: it pins the dependency versions in
+the repo's `Cargo.lock`. Without it Cargo resolves to the latest releases, and
+`dispatch2 0.3.1` (a transitive macOS dep of `ctrlc`) fails to build with a
+`recursion limit reached` macro error.
 
 ## Step 3: Write config
 
@@ -104,6 +107,7 @@ key (auth is not checked in V1). The `model` field selects a chain name (e.g.
 
 | Symptom | Fix |
 |---|---|
+| `cargo install` fails: `recursion limit reached` in `dispatch2` | you omitted `--locked`; re-run the Step 2 command with `--locked` so the pinned `dispatch2 0.3.0` is used instead of the broken `0.3.1` |
 | `failed to bind 127.0.0.1:3456` | another process owns the port; change `[server] listen` |
 | chat returns `503 all_backends_failed` | read the `detail` array; each entry names the backend and its error |
 | `agy` leg always fails / `spawn failed` | `agy` symlink is broken — install Antigravity.app |
