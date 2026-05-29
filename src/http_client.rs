@@ -104,10 +104,7 @@ fn parse_response(raw: &[u8]) -> io::Result<(u16, String)> {
 /// terminating zero-size chunk or when the data is exhausted.
 fn dechunk(mut data: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
-    loop {
-        let Some(nl) = data.windows(2).position(|w| w == b"\r\n") else {
-            break;
-        };
+    while let Some(nl) = data.windows(2).position(|w| w == b"\r\n") {
         let size_line = &data[..nl];
         let hex = size_line.split(|&b| b == b';').next().unwrap_or(size_line);
         let size = usize::from_str_radix(String::from_utf8_lossy(hex).trim(), 16).unwrap_or(0);
