@@ -757,6 +757,7 @@ name = "tmuxlet-server"
 version = "0.1.0"
 dependencies = [
  "ctrlc",
+ "nix 0.28.0",
  "portable-pty",
  "rustls",
  "serde",

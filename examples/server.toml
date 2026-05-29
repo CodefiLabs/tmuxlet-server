@@ -16,7 +16,11 @@ log_level = "info"                   # trace | info | warn | error
 [backends.agy]
 type = "cli"
 bin = "/Users/kk/.antigravity/antigravity/bin/agy"   # NOTE: a symlink into Antigravity.app — must be installed
-args = ["-p"]
+# `{prompt}` is substituted with the request prompt. agy's `--print`/`-p` flag
+# takes the prompt as its VALUE, so it must land in argv — not on stdin. Omit
+# the placeholder and the prompt is instead appended as a trailing positional
+# (non-PTY) or written to the child's stdin (PTY).
+args = ["-p", "{prompt}"]
 pty = true                           # agy detects non-TTY and redirects output; needs a PTY
 
 [backends.ollama-kimi]
