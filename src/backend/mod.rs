@@ -8,6 +8,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
+#[derive(Debug)]
 pub struct DispatchResult {
     pub content: String,
     pub model_label: String,

@@ -50,6 +50,11 @@ cp examples/server.toml ~/.tmuxlet/server.toml   # then edit for the detected ba
 Use only backends whose prerequisites passed Step 1. `api_key_env` holds the
 NAME of an env var (e.g. `OPENROUTER_API_KEY`), never the key itself.
 
+For `cli` backends, put `{prompt}` in `args` where the tool expects the prompt
+(e.g. `args = ["-p", "{prompt}"]` for a tool whose `--print` flag takes the
+prompt as its value, like `agy`). Without the placeholder the prompt is appended
+as a trailing positional arg (non-PTY) or written to the child's stdin (PTY).
+
 ## Step 4: Validate config
 
 ```

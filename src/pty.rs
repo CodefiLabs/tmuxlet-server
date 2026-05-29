@@ -1,4 +1,4 @@
-use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use portable_pty::{CommandBuilder, ExitStatus, PtySize, native_pty_system};
 use std::io::{Read, Write};
 use std::sync::mpsc;
 use std::thread;
@@ -8,10 +8,26 @@ fn stringify<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
 }
 
+/// Disable echo and canonical input on the PTY so the prompt we write to the
+/// child's stdin (and the EOF on close) is not echoed back into the captured
+/// output. Best-effort: on failure the default tty modes are left in place.
+#[cfg(unix)]
+fn disable_pty_echo(fd: std::os::unix::io::RawFd) {
+    use nix::sys::termios::{LocalFlags, SetArg, tcgetattr, tcsetattr};
+    use std::os::unix::io::BorrowedFd;
+    // SAFETY: `fd` is owned by the PtyPair master, which outlives this borrow.
+    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+    if let Ok(mut t) = tcgetattr(borrowed) {
+        t.local_flags.remove(LocalFlags::ECHO | LocalFlags::ICANON);
+        let _ = tcsetattr(borrowed, SetArg::TCSANOW, &t);
+    }
+}
+
 /// Run `program args` in a PTY, write `prompt` to its stdin, and capture all
 /// output until the child exits or `timeout` elapses (then it is killed).
 /// Fully synchronous (plain std threads). macOS EIO-on-slave-close is treated
-/// as EOF. Returns the raw captured bytes (clean with `clean_output`).
+/// as EOF. Returns the raw captured bytes (clean with `clean_output`) together
+/// with the child's exit status, so callers can fail over on a non-zero exit.
 pub fn run_in_pty(
     program: &str,
     args: &[String],
@@ -19,7 +35,7 @@ pub fn run_in_pty(
     cwd: &str,
     prompt: &str,
     timeout: Duration,
-) -> Result<Vec<u8>, String> {
+) -> Result<(Vec<u8>, ExitStatus), String> {
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
@@ -29,6 +45,12 @@ pub fn run_in_pty(
             pixel_height: 0,
         })
         .map_err(stringify)?;
+
+    // Quiet the line discipline before anything is spawned or written.
+    #[cfg(unix)]
+    if let Some(fd) = pair.master.as_raw_fd() {
+        disable_pty_echo(fd);
+    }
 
     let mut cmd = CommandBuilder::new(program);
     cmd.args(args);
@@ -78,13 +100,13 @@ pub fn run_in_pty(
     let _ = writer.flush();
     drop(writer); // send EOF on the child's stdin.
 
-    let _ = child.wait().map_err(stringify)?;
+    let status = child.wait().map_err(stringify)?;
     let _ = done_tx.send(());
     let _ = watchdog.join();
     let _ = reader_handle.join();
     let output = out_rx.recv().unwrap_or_default();
     drop(pair.master);
-    Ok(output)
+    Ok((output, status))
 }
 
 /// Strip ANSI/CSI/OSC escape sequences, carriage returns, and C0 control bytes
