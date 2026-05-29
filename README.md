@@ -7,8 +7,13 @@ heterogeneous AI backends:
 - **`tmuxlet`** — interactive coding CLIs (claude, codex, gemini, …) run through
   [`tmuxlet`](https://github.com/CodefiLabs/tmuxlet).
 - **`cli`** — arbitrary CLI tools, optionally in a PTY (for tools like `agy`
-  that detect a non-TTY and redirect output).
+  that detect a non-TTY and redirect output). Use the `{prompt}` placeholder in
+  `args` to inject the prompt as a flag value (e.g. `args = ["-p", "{prompt}"]`);
+  without it the prompt is appended as the final positional argument.
 - **`api`** — any OpenAI-compatible HTTP upstream (Ollama, OpenRouter, …).
+
+> Companion project: [**CodefiLabs/tmuxlet**](https://github.com/CodefiLabs/tmuxlet)
+> drives the interactive CLIs behind the `tmuxlet` backend.
 
 Downstream clients (Continue, Cursor, Hermes, anything OpenAI-shaped) see one
 endpoint; the routing happens server-side from a TOML config. A request's
@@ -54,7 +59,8 @@ the full response is ready. True incremental streaming is V2.
 
 Synchronous (no tokio). Direct deps: `tiny_http`, `ctrlc`, `serde`,
 `serde_json`, `toml`, `rustls` (ring backend — no C toolchain), `webpki-roots`,
-`portable-pty`. ~25 crates including transitive.
+`portable-pty`, `nix` (already in-tree via `portable-pty`; used to disable PTY
+echo). ~25 crates including transitive.
 
 ## Status
 
