@@ -23,6 +23,8 @@ pub enum BackendError {
     /// name, status code, and the first chars of the upstream error body (U-7).
     Http(String, u16, String),
     Parse(String, String),
+    /// U-20: backend at its max_concurrent cap; the chain advances.
+    Busy(String),
 }
 
 impl fmt::Display for BackendError {
@@ -40,6 +42,7 @@ impl fmt::Display for BackendError {
                 }
             }
             BackendError::Parse(n, m) => write!(f, "[{n}] parse error: {m}"),
+            BackendError::Busy(n) => write!(f, "[{n}] busy (max_concurrent reached)"),
         }
     }
 }
@@ -53,7 +56,8 @@ impl BackendError {
             | BackendError::Exit(n, _, _)
             | BackendError::Backend(n, _)
             | BackendError::Http(n, _, _)
-            | BackendError::Parse(n, _) => n,
+            | BackendError::Parse(n, _)
+            | BackendError::Busy(n) => n,
         }
     }
 
@@ -69,6 +73,7 @@ impl BackendError {
                 _ => "http error",
             },
             BackendError::Parse(_, _) => "parse error",
+            BackendError::Busy(_) => "busy",
         }
     }
 }
@@ -87,6 +92,8 @@ pub struct TmuxletBackend {
     /// S-4: use tmuxlet's stdin form (`-p ... -`) when the installed tmuxlet
     /// supports it (probed once at startup); otherwise argv.
     pub use_stdin: bool,
+    /// U-20: max simultaneous dispatches (None = unlimited).
+    pub max_concurrent: Option<usize>,
 }
 
 pub struct ApiBackend {
@@ -99,6 +106,8 @@ pub struct ApiBackend {
     pub allow_empty: bool,
     /// S-5: cap on the upstream response body (server-level).
     pub max_response_bytes: u64,
+    /// U-20: max simultaneous dispatches (None = unlimited).
+    pub max_concurrent: Option<usize>,
 }
 
 pub struct CliBackend {
@@ -114,6 +123,8 @@ pub struct CliBackend {
     pub env_pass: Option<Vec<String>>,
     /// S-4: write the prompt to stdin instead of argv (plain mode).
     pub stdin_prompt: bool,
+    /// U-20: max simultaneous dispatches (None = unlimited).
+    pub max_concurrent: Option<usize>,
 }
 
 pub enum Backend {
@@ -167,6 +178,7 @@ impl Backend {
                 cwd,
                 allow_empty,
                 env_pass,
+                max_concurrent,
             } => Backend::Tmuxlet(TmuxletBackend {
                 name: name.into(),
                 bin: resolve_program("tmuxlet", env),
@@ -176,6 +188,7 @@ impl Backend {
                 allow_empty: *allow_empty,
                 env_pass: resolve_env_pass(env_pass),
                 use_stdin: defaults.tmuxlet_stdin,
+                max_concurrent: *max_concurrent,
             }),
             config::Backend::Api {
                 base_url,
@@ -184,6 +197,7 @@ impl Backend {
                 extra_body,
                 timeout_secs,
                 allow_empty,
+                max_concurrent,
             } => Backend::Api(ApiBackend {
                 name: name.into(),
                 base_url: base_url.clone(),
@@ -193,6 +207,7 @@ impl Backend {
                 timeout: timeout_secs.map(Duration::from_secs),
                 allow_empty: *allow_empty,
                 max_response_bytes: defaults.max_response_bytes,
+                max_concurrent: *max_concurrent,
             }),
             config::Backend::Cli {
                 bin,
@@ -203,6 +218,7 @@ impl Backend {
                 allow_empty,
                 env_pass,
                 stdin_prompt,
+                max_concurrent,
             } => Backend::Cli(CliBackend {
                 name: name.into(),
                 bin: PathBuf::from(bin),
@@ -217,6 +233,7 @@ impl Backend {
                 allow_empty: *allow_empty,
                 env_pass: resolve_env_pass(env_pass),
                 stdin_prompt: *stdin_prompt,
+                max_concurrent: *max_concurrent,
             }),
         }
     }
@@ -246,6 +263,15 @@ impl Backend {
         match self {
             Backend::Api(b) => b.timeout,
             _ => None,
+        }
+    }
+
+    /// U-20: max simultaneous dispatches to this backend (None = unlimited).
+    pub fn max_concurrent(&self) -> Option<usize> {
+        match self {
+            Backend::Tmuxlet(b) => b.max_concurrent,
+            Backend::Api(b) => b.max_concurrent,
+            Backend::Cli(b) => b.max_concurrent,
         }
     }
 

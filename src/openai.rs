@@ -89,6 +89,16 @@ pub fn flatten_to_prompt(messages: &[ChatMessage]) -> String {
     blocks.join("\n\n")
 }
 
+/// §5: the text of the last user message, for auto-router classification.
+pub fn last_user_text(messages: &[ChatMessage]) -> String {
+    messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .map(|m| content_to_text(&m.content))
+        .unwrap_or_default()
+}
+
 // ---------- Non-streaming response ----------
 #[derive(Debug, Serialize)]
 pub struct ChatCompletion {

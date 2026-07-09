@@ -190,6 +190,7 @@ mod tests {
             allow_empty: false,
             env_pass: None,
             stdin_prompt: false,
+            max_concurrent: None,
         }
     }
 

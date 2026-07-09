@@ -154,6 +154,7 @@ mod tests {
             allow_empty: false,
             env_pass: None,
             use_stdin: false,
+            max_concurrent: None,
         }
     }
 

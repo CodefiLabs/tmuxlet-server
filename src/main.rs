@@ -4,6 +4,7 @@ mod config;
 mod env;
 mod http;
 mod http_client;
+mod log;
 mod openai;
 mod pty;
 mod router;
@@ -16,7 +17,7 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::process::ExitCode;
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tiny_http::Server;
 
@@ -281,8 +282,10 @@ fn run_serve(config_path: &str, allow_remote: bool) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // U-8: honor log_level for the rest of startup + request handling.
+    log::set_level(&cfg.server.log_level);
     for w in &warnings {
-        eprintln!("[warn] {w}");
+        log::warn(w);
     }
 
     // 3. Capture environment for backends (S-9 timeout-bounded).
@@ -373,16 +376,23 @@ fn run_serve(config_path: &str, allow_remote: bool) -> ExitCode {
         });
     }
 
+    // P-1: workers = configured, else max(16, cores) — the workload is blocking
+    // I/O, so cores alone under-provisions (one long tmuxlet turn pins a worker).
+    let workers = cfg.server.workers.unwrap_or_else(|| {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        cores.max(16)
+    });
     let state = Arc::new(http::State {
         cfg,
         env: environment,
         backends,
         auth_token,
         redact_errors: !loopback,
+        health: Mutex::new(HashMap::new()),
+        active: Mutex::new(HashMap::new()),
     });
-    let workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
     http::serve(server, state, workers);
     ExitCode::SUCCESS
 }

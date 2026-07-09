@@ -13,6 +13,9 @@ pub struct Config {
     pub backends: HashMap<String, Backend>,
     #[serde(default)]
     pub chains: HashMap<String, Chain>,
+    /// §5: auto-routers (name -> routable model id).
+    #[serde(default)]
+    pub routers: HashMap<String, Router>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -23,9 +26,8 @@ pub struct Server {
     pub request_timeout_secs: u64,
     #[serde(default = "default_env_source")]
     pub env_source: String,
-    // Accepted for forward-compat; V1 logging is unleveled (plain eprintln).
+    /// U-8: log level (error|warn|info|debug).
     #[serde(default = "default_log_level")]
-    #[allow(dead_code)]
     pub log_level: String,
     /// Watchdog for shell env capture (S-9): a blocking `~/.zshrc` must not hang
     /// startup forever. On expiry the capture is abandoned and the process env
@@ -45,6 +47,22 @@ pub struct Server {
     /// S-5: cap on a single upstream response body.
     #[serde(default = "default_max_response_bytes")]
     pub max_response_bytes: u64,
+    /// P-1: max concurrent in-flight requests (worker threads). Default
+    /// max(16, cores).
+    #[serde(default)]
+    pub workers: Option<usize>,
+    /// P-6: optional total time budget across a chain's legs (seconds).
+    #[serde(default)]
+    pub chain_budget_secs: Option<u64>,
+    /// P-9: enable failure-aware backend cooldown.
+    #[serde(default = "default_true")]
+    pub cooldown: bool,
+    /// P-9: base cooldown for rate-limit / http failures (seconds).
+    #[serde(default = "default_cooldown_secs")]
+    pub cooldown_secs: u64,
+    /// U-3: reject unknown models instead of falling back to default_chain.
+    #[serde(default)]
+    pub strict_models: bool,
 }
 
 fn default_timeout() -> u64 {
@@ -62,10 +80,39 @@ fn default_env_capture_timeout() -> u64 {
 fn default_max_response_bytes() -> u64 {
     64 * 1024 * 1024
 }
+fn default_true() -> bool {
+    true
+}
+fn default_cooldown_secs() -> u64 {
+    60
+}
+fn default_classifier_timeout() -> u64 {
+    5
+}
+fn default_classifier_max_chars() -> usize {
+    4000
+}
 
 #[derive(Debug, Deserialize)]
 pub struct Chain {
     pub order: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Router {
+    /// A defined backend (not a router) that classifies the task.
+    pub classifier: String,
+    #[serde(default = "default_classifier_timeout")]
+    pub classifier_timeout_secs: u64,
+    #[serde(default = "default_classifier_max_chars")]
+    pub classifier_max_chars: usize,
+    /// Class used when classification fails/times out/answers garbage.
+    pub fallback_class: String,
+    #[serde(default)]
+    pub classifier_prompt: Option<String>,
+    /// class -> chain or backend.
+    #[serde(default)]
+    pub routes: HashMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -85,6 +132,9 @@ pub enum Backend {
         /// server-level default.
         #[serde(default)]
         env_pass: Option<Vec<String>>,
+        /// U-20: max simultaneous dispatches to this backend.
+        #[serde(default)]
+        max_concurrent: Option<usize>,
     },
     Api {
         base_url: String,
@@ -97,6 +147,9 @@ pub enum Backend {
         timeout_secs: Option<u64>,
         #[serde(default)]
         allow_empty: bool,
+        /// U-20: max simultaneous dispatches to this backend.
+        #[serde(default)]
+        max_concurrent: Option<usize>,
     },
     Cli {
         bin: String,
@@ -121,6 +174,9 @@ pub enum Backend {
         /// mode; a `{prompt}` placeholder still takes precedence).
         #[serde(default)]
         stdin_prompt: bool,
+        /// U-20: max simultaneous dispatches to this backend.
+        #[serde(default)]
+        max_concurrent: Option<usize>,
     },
 }
 
@@ -169,6 +225,36 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
             "server.listen '{}' is not a valid address:port (e.g. \"127.0.0.1:3456\")",
             cfg.server.listen
         ));
+    }
+    // §5.3: auto-router validation.
+    for (rname, r) in &cfg.routers {
+        if cfg.chains.contains_key(rname) || cfg.backends.contains_key(rname) {
+            return Err(format!(
+                "router '{rname}' collides with a chain or backend name — rename one"
+            ));
+        }
+        if !cfg.backends.contains_key(&r.classifier) {
+            return Err(format!(
+                "router '{rname}' classifier '{}' is not a defined backend",
+                r.classifier
+            ));
+        }
+        if r.routes.is_empty() {
+            return Err(format!("router '{rname}' has no [routers.{rname}.routes]"));
+        }
+        for (class, target) in &r.routes {
+            if !cfg.chains.contains_key(target) && !cfg.backends.contains_key(target) {
+                return Err(format!(
+                    "router '{rname}' route '{class}' -> '{target}' is not a defined chain or backend"
+                ));
+            }
+        }
+        if !r.routes.contains_key(&r.fallback_class) {
+            return Err(format!(
+                "router '{rname}' fallback_class '{}' is not one of its routes",
+                r.fallback_class
+            ));
+        }
     }
     Ok(())
 }
@@ -234,7 +320,7 @@ pub fn lint(cfg: &Config, text: &str) -> Vec<String> {
 
 // ---- U-4 unknown-key detection ----
 
-const TOP_KEYS: &[&str] = &["server", "backends", "chains"];
+const TOP_KEYS: &[&str] = &["server", "backends", "chains", "routers"];
 const SERVER_KEYS: &[&str] = &[
     "listen",
     "default_chain",
@@ -246,6 +332,11 @@ const SERVER_KEYS: &[&str] = &[
     "auth_token_env",
     "env_pass",
     "max_response_bytes",
+    "workers",
+    "chain_budget_secs",
+    "cooldown",
+    "cooldown_secs",
+    "strict_models",
 ];
 const CHAIN_KEYS: &[&str] = &["order"];
 const TMUXLET_KEYS: &[&str] = &[
@@ -255,6 +346,7 @@ const TMUXLET_KEYS: &[&str] = &[
     "cwd",
     "allow_empty",
     "env_pass",
+    "max_concurrent",
 ];
 const API_KEYS: &[&str] = &[
     "type",
@@ -264,6 +356,7 @@ const API_KEYS: &[&str] = &[
     "extra_body",
     "timeout_secs",
     "allow_empty",
+    "max_concurrent",
 ];
 const CLI_KEYS: &[&str] = &[
     "type",
@@ -275,6 +368,15 @@ const CLI_KEYS: &[&str] = &[
     "allow_empty",
     "env_pass",
     "stdin_prompt",
+    "max_concurrent",
+];
+const ROUTER_KEYS: &[&str] = &[
+    "classifier",
+    "classifier_timeout_secs",
+    "classifier_max_chars",
+    "fallback_class",
+    "classifier_prompt",
+    "routes",
 ];
 
 /// Walk the parsed TOML table one level deep per known section and report keys
@@ -322,6 +424,19 @@ fn unknown_keys(text: &str) -> Vec<(String, Option<String>)> {
                 for (k, _) in b {
                     if !allowed.contains(&k.as_str()) {
                         out.push((format!("backends.{bname}.{k}"), nearest(k, allowed)));
+                    }
+                }
+            }
+        }
+    }
+    if let Some(Value::Table(routers)) = table.get("routers") {
+        for (rname, rval) in routers {
+            if let Value::Table(r) = rval {
+                for (k, _) in r {
+                    // `routes` is a free-form class->target map; don't validate
+                    // its keys.
+                    if !ROUTER_KEYS.contains(&k.as_str()) {
+                        out.push((format!("routers.{rname}.{k}"), nearest(k, ROUTER_KEYS)));
                     }
                 }
             }
