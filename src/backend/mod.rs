@@ -82,6 +82,11 @@ pub struct TmuxletBackend {
     pub target_args: Vec<String>,
     pub cwd: PathBuf,
     pub allow_empty: bool,
+    /// S-3: resolved env allowlist (per-backend or server default).
+    pub env_pass: Option<Vec<String>>,
+    /// S-4: use tmuxlet's stdin form (`-p ... -`) when the installed tmuxlet
+    /// supports it (probed once at startup); otherwise argv.
+    pub use_stdin: bool,
 }
 
 pub struct ApiBackend {
@@ -92,6 +97,8 @@ pub struct ApiBackend {
     pub extra_body: serde_json::Value,
     pub timeout: Option<Duration>,
     pub allow_empty: bool,
+    /// S-5: cap on the upstream response body (server-level).
+    pub max_response_bytes: u64,
 }
 
 pub struct CliBackend {
@@ -103,6 +110,10 @@ pub struct CliBackend {
     /// U-12: (cols, rows).
     pub pty_size: (u16, u16),
     pub allow_empty: bool,
+    /// S-3: resolved env allowlist (per-backend or server default).
+    pub env_pass: Option<Vec<String>>,
+    /// S-4: write the prompt to stdin instead of argv (plain mode).
+    pub stdin_prompt: bool,
 }
 
 pub enum Backend {
@@ -129,15 +140,33 @@ pub fn resolve_program(program: &str, env: &Env) -> PathBuf {
     PathBuf::from(program)
 }
 
+/// Server-level values threaded into each runtime backend at build time.
+pub struct ServerDefaults {
+    pub max_response_bytes: u64,
+    /// S-3 server-level env allowlist (used when a backend defines none).
+    pub env_pass: Option<Vec<String>>,
+    /// S-4: whether the installed tmuxlet supports the stdin form.
+    pub tmuxlet_stdin: bool,
+}
+
 impl Backend {
-    pub fn from_config(name: &str, c: &config::Backend, env: &Env) -> Backend {
+    pub fn from_config(
+        name: &str,
+        c: &config::Backend,
+        env: &Env,
+        defaults: &ServerDefaults,
+    ) -> Backend {
         let home = || std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        // S-3: a per-backend env_pass overrides the server-level default.
+        let resolve_env_pass =
+            |own: &Option<Vec<String>>| own.clone().or_else(|| defaults.env_pass.clone());
         match c {
             config::Backend::Tmuxlet {
                 target,
                 target_args,
                 cwd,
                 allow_empty,
+                env_pass,
             } => Backend::Tmuxlet(TmuxletBackend {
                 name: name.into(),
                 bin: resolve_program("tmuxlet", env),
@@ -145,6 +174,8 @@ impl Backend {
                 target_args: target_args.clone(),
                 cwd: PathBuf::from(cwd.clone().unwrap_or_else(home)),
                 allow_empty: *allow_empty,
+                env_pass: resolve_env_pass(env_pass),
+                use_stdin: defaults.tmuxlet_stdin,
             }),
             config::Backend::Api {
                 base_url,
@@ -161,6 +192,7 @@ impl Backend {
                 extra_body: extra_body.clone(),
                 timeout: timeout_secs.map(Duration::from_secs),
                 allow_empty: *allow_empty,
+                max_response_bytes: defaults.max_response_bytes,
             }),
             config::Backend::Cli {
                 bin,
@@ -169,6 +201,8 @@ impl Backend {
                 cwd,
                 pty_size,
                 allow_empty,
+                env_pass,
+                stdin_prompt,
             } => Backend::Cli(CliBackend {
                 name: name.into(),
                 bin: PathBuf::from(bin),
@@ -181,6 +215,8 @@ impl Backend {
                     .map(|v| (v[0], v[1]))
                     .unwrap_or((200, 50)),
                 allow_empty: *allow_empty,
+                env_pass: resolve_env_pass(env_pass),
+                stdin_prompt: *stdin_prompt,
             }),
         }
     }
@@ -275,7 +311,12 @@ order = ["t"]
         )
         .unwrap();
         let env = crate::env::Env::capture("process", "", 5);
-        let b = Backend::from_config("t", &cfg.backends["t"], &env);
+        let defaults = ServerDefaults {
+            max_response_bytes: 1024,
+            env_pass: None,
+            tmuxlet_stdin: false,
+        };
+        let b = Backend::from_config("t", &cfg.backends["t"], &env, &defaults);
         assert_eq!(b.name(), "t");
         assert!(matches!(b, Backend::Tmuxlet(_)));
     }

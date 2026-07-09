@@ -1,3 +1,4 @@
+mod auth;
 mod backend;
 mod config;
 mod env;
@@ -27,6 +28,7 @@ struct Args {
     config: String,
     validate: bool,
     check_backends: bool,
+    allow_remote: bool,
 }
 
 fn main() -> ExitCode {
@@ -35,6 +37,7 @@ fn main() -> ExitCode {
         config: DEFAULT_CONFIG.to_string(),
         validate: false,
         check_backends: false,
+        allow_remote: false,
     };
     let mut i = 0;
     while i < argv.len() {
@@ -49,6 +52,7 @@ fn main() -> ExitCode {
             }
             "--validate" => args.validate = true,
             "--check-backends" => args.check_backends = true,
+            "--allow-remote-unauthenticated" => args.allow_remote = true,
             "--config" => {
                 i += 1;
                 match argv.get(i) {
@@ -75,7 +79,7 @@ fn main() -> ExitCode {
         return run_validate(&args);
     }
 
-    run_serve(&args.config)
+    run_serve(&args.config, args.allow_remote)
 }
 
 /// Capture the backend environment per config (S-9 timeout-bounded).
@@ -119,6 +123,13 @@ fn run_validate(args: &Args) -> ExitCode {
         if !check_backends(&cfg, &env) {
             failed = true;
         }
+    }
+    // S-2: strict validate flags an unauthenticated non-loopback bind.
+    if args.validate
+        && let Err(e) = bind_policy(&cfg.server.listen, cfg.server.auth, args.allow_remote)
+    {
+        eprintln!("tmuxlet-server: {e}");
+        failed = true;
     }
     if failed {
         ExitCode::FAILURE
@@ -211,7 +222,52 @@ fn check_backends(cfg: &Config, env: &Env) -> bool {
     all_ok
 }
 
-fn run_serve(config_path: &str) -> ExitCode {
+fn listen_is_loopback(listen: &str) -> bool {
+    match listen.to_socket_addrs() {
+        Ok(addrs) => {
+            let addrs: Vec<_> = addrs.collect();
+            !addrs.is_empty() && addrs.iter().all(|a| a.ip().is_loopback())
+        }
+        Err(_) => false,
+    }
+}
+
+/// S-2: refuse to expose an unauthenticated server to the network.
+fn bind_policy(listen: &str, auth_on: bool, allow_remote: bool) -> Result<(), String> {
+    if !listen_is_loopback(listen) && !auth_on && !allow_remote {
+        return Err(format!(
+            "refusing to bind non-loopback address '{listen}' without auth — set `auth = true` in server.toml (a token is generated to ~/.tmuxlet/token), or pass --allow-remote-unauthenticated to override"
+        ));
+    }
+    Ok(())
+}
+
+/// S-4: probe whether the installed tmuxlet advertises a stdin form in its help
+/// text. Conservative: any failure or ambiguity selects argv mode (never fails
+/// a request).
+fn probe_tmuxlet_stdin(env: &Env) -> bool {
+    let bin = backend::resolve_program("tmuxlet", env);
+    match Command::new(&bin)
+        .arg("--help")
+        .env_clear()
+        .envs(env.as_pairs())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+    {
+        Ok(o) => {
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            );
+            text.to_ascii_lowercase().contains("stdin")
+        }
+        Err(_) => false,
+    }
+}
+
+fn run_serve(config_path: &str, allow_remote: bool) -> ExitCode {
     // 1. rustls ring CryptoProvider — REQUIRED before any TLS use (api backend).
     let _ = rustls::crypto::ring::default_provider().install_default();
 
@@ -242,15 +298,57 @@ fn run_serve(config_path: &str) -> ExitCode {
         }
     }
 
-    // 4. Build the runtime backends once (P-3), resolving tmuxlet's path from
-    //    the captured env PATH (F-4).
+    // 4. Resolve the auth token (S-1).
+    let token_file = config::tilde_path("~/.tmuxlet/token");
+    let auth_token = match auth::resolve(
+        cfg.server.auth,
+        cfg.server.auth_token_env.as_deref(),
+        &environment,
+        &token_file,
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("tmuxlet-server: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // 5. Bind policy (S-2): refuse to expose an unauthenticated server.
+    if let Err(e) = bind_policy(&cfg.server.listen, auth_token.is_some(), allow_remote) {
+        eprintln!("tmuxlet-server: {e}");
+        return ExitCode::FAILURE;
+    }
+    let loopback = listen_is_loopback(&cfg.server.listen);
+    if !loopback {
+        eprintln!(
+            "[warn] bound to a non-loopback address ({}); tiny_http has no TLS — use an SSH tunnel for remote access",
+            cfg.server.listen
+        );
+    }
+
+    // 6. Build the runtime backends once (P-3), resolving tmuxlet's path from the
+    //    captured env PATH (F-4). Probe tmuxlet's stdin form once (S-4).
+    let has_tmuxlet = cfg
+        .backends
+        .values()
+        .any(|b| matches!(b, config::Backend::Tmuxlet { .. }));
+    let defaults = backend::ServerDefaults {
+        max_response_bytes: cfg.server.max_response_bytes,
+        env_pass: cfg.server.env_pass.clone(),
+        tmuxlet_stdin: has_tmuxlet && probe_tmuxlet_stdin(&environment),
+    };
     let backends: HashMap<String, Backend> = cfg
         .backends
         .iter()
-        .map(|(name, b)| (name.clone(), Backend::from_config(name, b, &environment)))
+        .map(|(name, b)| {
+            (
+                name.clone(),
+                Backend::from_config(name, b, &environment, &defaults),
+            )
+        })
         .collect();
 
-    // 5. Bind.
+    // 7. Bind.
     let listen = cfg.server.listen.clone();
     let server = match Server::http(&listen) {
         Ok(s) => Arc::new(s),
@@ -260,12 +358,13 @@ fn run_serve(config_path: &str) -> ExitCode {
         }
     };
     eprintln!(
-        "tmuxlet-server {VERSION} listening on http://{listen} ({} backends, {} chains)",
+        "tmuxlet-server {VERSION} listening on http://{listen} ({} backends, {} chains, auth {})",
         cfg.backends.len(),
-        cfg.chains.len()
+        cfg.chains.len(),
+        if auth_token.is_some() { "on" } else { "off" }
     );
 
-    // 6. Signal handler → unblock workers for graceful shutdown.
+    // 8. Signal handler → unblock workers for graceful shutdown.
     {
         let server = Arc::clone(&server);
         let _ = ctrlc::set_handler(move || {
@@ -278,6 +377,8 @@ fn run_serve(config_path: &str) -> ExitCode {
         cfg,
         env: environment,
         backends,
+        auth_token,
+        redact_errors: !loopback,
     });
     let workers = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -288,6 +389,6 @@ fn run_serve(config_path: &str) -> ExitCode {
 
 fn print_help() {
     println!(
-        "tmuxlet-server {VERSION}\n\nUsage:\n  tmuxlet-server [--config FILE]    Start the server (default config: {DEFAULT_CONFIG})\n  tmuxlet-server --validate         Validate config (strict) and exit\n  tmuxlet-server --check-backends   Probe each backend's reachability and exit\n  tmuxlet-server --version          Print version\n  tmuxlet-server --help             Print this help\n\nConfig is TOML at {DEFAULT_CONFIG} (override with --config FILE or --config=FILE).\nA fresh config listens on {DEFAULT_LISTEN}."
+        "tmuxlet-server {VERSION}\n\nUsage:\n  tmuxlet-server [--config FILE]    Start the server (default config: {DEFAULT_CONFIG})\n  tmuxlet-server --validate         Validate config (strict) and exit\n  tmuxlet-server --check-backends   Probe each backend's reachability and exit\n  tmuxlet-server --version          Print version\n  tmuxlet-server --help             Print this help\n\nConfig is TOML at {DEFAULT_CONFIG} (override with --config FILE or --config=FILE).\nA fresh config listens on {DEFAULT_LISTEN}. Set `auth = true` for a bearer token\n(written to ~/.tmuxlet/token); --allow-remote-unauthenticated permits a\nnon-loopback bind without auth."
     );
 }

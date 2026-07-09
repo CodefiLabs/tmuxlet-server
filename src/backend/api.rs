@@ -92,8 +92,18 @@ pub fn dispatch(
         bearer.as_deref(),
         &body,
         timeout,
+        b.max_response_bytes as usize,
     )
-    .map_err(|e| BackendError::Spawn(b.name.clone(), e.to_string()))?;
+    .map_err(|e| {
+        let m = e.to_string();
+        // S-5: an over-cap response is a Parse-class failure (chain advances);
+        // everything else (connect/read) is Spawn-class.
+        if m.contains("max_response_bytes") {
+            BackendError::Parse(b.name.clone(), m)
+        } else {
+            BackendError::Spawn(b.name.clone(), m)
+        }
+    })?;
     if !(200..300).contains(&status) {
         return Err(BackendError::Http(
             b.name.clone(),

@@ -60,7 +60,7 @@ pub fn dispatch(
         let (raw, status, timed_out) = pty::run_in_pty(
             &b.bin.display().to_string(),
             &pty_args,
-            &env.as_pairs(),
+            &env.filtered_pairs(b.env_pass.as_deref()),
             &b.cwd.display().to_string(),
             stdin_payload,
             cols,
@@ -85,16 +85,41 @@ pub fn dispatch(
         }
         cleaned
     } else {
+        // S-4: keep the prompt out of argv when stdin_prompt is set (a
+        // `{prompt}` placeholder still explicitly puts it in argv).
+        let (subst_args, substituted) = substitute_prompt(&b.args, prompt);
+        let use_stdin = b.stdin_prompt && !substituted;
+        // Non-stdin argv uses the default construction (plain_args); stdin mode
+        // keeps the prompt out of argv entirely.
+        let argv = if use_stdin {
+            subst_args
+        } else {
+            plain_args(b, prompt)
+        };
         let mut child = Command::new(&b.bin)
-            .args(plain_args(b, prompt))
+            .args(&argv)
             .current_dir(&b.cwd)
             .env_clear()
-            .envs(env.as_pairs())
-            .stdin(Stdio::null())
+            .envs(env.filtered_pairs(b.env_pass.as_deref()))
+            .stdin(if use_stdin {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| BackendError::Spawn(b.name.clone(), e.to_string()))?;
+        // Write the prompt to stdin on a thread so a large prompt can't deadlock
+        // against a child that hasn't started draining it yet.
+        if use_stdin && let Some(mut si) = child.stdin.take() {
+            let payload = prompt.to_string();
+            thread::spawn(move || {
+                use std::io::Write;
+                let _ = si.write_all(payload.as_bytes());
+                // `si` drops here, closing stdin (EOF).
+            });
+        }
         let mut out = child.stdout.take().unwrap();
         let mut err = child.stderr.take().unwrap();
         let (otx, orx) = std::sync::mpsc::channel();
@@ -163,6 +188,8 @@ mod tests {
             cwd: PathBuf::from("/tmp"),
             pty_size: (200, 50),
             allow_empty: false,
+            env_pass: None,
+            stdin_prompt: false,
         }
     }
 

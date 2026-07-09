@@ -63,7 +63,8 @@ fn connect(host: &str, port: u16, timeout: Duration) -> io::Result<TcpStream> {
     Ok(tcp)
 }
 
-/// Read one HTTP response body into `buf`.
+/// Read one HTTP response body into `buf`, bounded by `max_bytes` (S-5; 0 = no
+/// cap).
 ///
 /// F-5: when the response carries a `Content-Length`, stop reading once exactly
 /// that many body bytes have arrived — a server that ignores our
@@ -71,11 +72,14 @@ fn connect(host: &str, port: u16, timeout: Duration) -> io::Result<TcpStream> {
 /// the read timeout and cause a false failure / needless fallback. Chunked and
 /// close-delimited responses read to EOF (unchanged).
 ///
+/// S-5: if the body exceeds `max_bytes`, error out (bounded memory) so the chain
+/// advances rather than a hostile/misbehaving upstream exhausting memory.
+///
 /// Tolerates an unclean close: TLS peers and some HTTP servers drop the
 /// connection without a close_notify / clean FIN once the body is sent (rustls
 /// 0.23 surfaces this as `UnexpectedEof`). A genuine stall instead surfaces as
 /// `WouldBlock`/`TimedOut` and IS propagated.
-fn read_body<R: Read>(r: &mut R, buf: &mut Vec<u8>) -> io::Result<()> {
+fn read_body<R: Read>(r: &mut R, buf: &mut Vec<u8>, max_bytes: usize) -> io::Result<()> {
     let mut chunk = [0u8; 8192];
     let mut header_end: Option<usize> = None;
     let mut content_length: Option<usize> = None;
@@ -92,6 +96,11 @@ fn read_body<R: Read>(r: &mut R, buf: &mut Vec<u8>) -> io::Result<()> {
             Ok(0) => return Ok(()),
             Ok(n) => {
                 buf.extend_from_slice(&chunk[..n]);
+                if max_bytes != 0 && buf.len() > max_bytes {
+                    return Err(io::Error::other(format!(
+                        "response exceeds max_response_bytes cap ({max_bytes} bytes)"
+                    )));
+                }
                 if header_end.is_none()
                     && let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n")
                 {
@@ -160,6 +169,7 @@ fn dechunk(mut data: &[u8]) -> Vec<u8> {
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn post_json(
     scheme: &str,
     host: &str,
@@ -168,6 +178,7 @@ pub fn post_json(
     bearer: Option<&str>,
     body: &str,
     timeout: Duration,
+    max_bytes: usize,
 ) -> io::Result<(u16, String)> {
     let req = request_bytes(host, port, path, bearer, body);
     let mut raw = Vec::new();
@@ -179,12 +190,12 @@ pub fn post_json(
         let mut tls = StreamOwned::new(conn, tcp);
         tls.write_all(req.as_bytes())?;
         tls.flush()?;
-        read_body(&mut tls, &mut raw)?;
+        read_body(&mut tls, &mut raw, max_bytes)?;
     } else {
         let mut sock = tcp;
         sock.write_all(req.as_bytes())?;
         sock.flush()?;
-        read_body(&mut sock, &mut raw)?;
+        read_body(&mut sock, &mut raw, max_bytes)?;
     }
     parse_response(&raw)
 }
@@ -234,9 +245,20 @@ mod tests {
         let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhelloEXTRA-BYTES-THAT-WOULD-BLOCK";
         let mut cursor: &[u8] = raw;
         let mut buf = Vec::new();
-        read_body(&mut cursor, &mut buf).unwrap();
+        read_body(&mut cursor, &mut buf, 0).unwrap();
         let (status, body) = parse_response(&buf).unwrap();
         assert_eq!(status, 200);
         assert_eq!(body, "hello");
+    }
+
+    #[test]
+    fn read_body_enforces_max_bytes() {
+        // No Content-Length -> reads to EOF, but the cap stops it early (S-5).
+        let mut body = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n".to_vec();
+        body.resize(body.len() + 1000, b'x');
+        let mut cursor: &[u8] = &body;
+        let mut buf = Vec::new();
+        let err = read_body(&mut cursor, &mut buf, 200).unwrap_err();
+        assert!(err.to_string().contains("max_response_bytes"));
     }
 }

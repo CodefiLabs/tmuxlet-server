@@ -40,6 +40,57 @@ impl Env {
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect()
     }
+
+    /// S-3: env pairs filtered to an allowlist of glob patterns, plus a minimal
+    /// always-passed base set (PATH/HOME/SHELL/TERM/LANG) so a tight allowlist
+    /// can't produce the "works in my terminal, fails in the server" class of
+    /// bug. `None` means no filtering (current behavior).
+    pub fn filtered_pairs(&self, allow: Option<&[String]>) -> Vec<(&str, &str)> {
+        match allow {
+            None => self.as_pairs(),
+            Some(patterns) => {
+                const BASE: &[&str] = &["PATH", "HOME", "SHELL", "TERM", "LANG"];
+                self.0
+                    .iter()
+                    .filter(|(k, _)| {
+                        BASE.contains(&k.as_str()) || patterns.iter().any(|p| glob_match(p, k))
+                    })
+                    .map(|(k, v)| (k.as_str(), v.as_str()))
+                    .collect()
+            }
+        }
+    }
+}
+
+/// Minimal glob match supporting `*` wildcards (e.g. `ANTHROPIC_*`, `*_TOKEN`,
+/// `AWS_*_KEY`). No character classes — just literal segments split on `*`.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    if !pattern.contains('*') {
+        return pattern == text;
+    }
+    let parts: Vec<&str> = pattern.split('*').collect();
+    let mut pos = 0usize;
+    for (i, part) in parts.iter().enumerate() {
+        if part.is_empty() {
+            continue;
+        }
+        if i == 0 {
+            // leading anchor
+            if !text[pos..].starts_with(part) {
+                return false;
+            }
+            pos += part.len();
+        } else if i == parts.len() - 1 {
+            // trailing anchor
+            return text[pos..].ends_with(part);
+        } else {
+            match text[pos..].find(part) {
+                Some(idx) => pos += idx + part.len(),
+                None => return false,
+            }
+        }
+    }
+    true
 }
 
 fn capture_shell(shell: &str, timeout: Duration) -> std::io::Result<HashMap<String, String>> {
@@ -166,5 +217,35 @@ mod tests {
     fn process_capture_has_path() {
         let env = Env::capture("process", "", 5);
         assert!(env.get("PATH").is_some() || env.get("HOME").is_some());
+    }
+
+    #[test]
+    fn glob_matches_prefix_suffix_and_infix() {
+        assert!(glob_match("ANTHROPIC_*", "ANTHROPIC_API_KEY"));
+        assert!(!glob_match("ANTHROPIC_*", "OPENAI_API_KEY"));
+        assert!(glob_match("*_TOKEN", "GH_TOKEN"));
+        assert!(!glob_match("*_TOKEN", "TOKEN_X"));
+        assert!(glob_match("AWS_*_KEY", "AWS_SECRET_KEY"));
+        assert!(!glob_match("AWS_*_KEY", "AWS_SECRET"));
+        assert!(glob_match("PATH", "PATH"));
+        assert!(!glob_match("PATH", "PATHX"));
+        assert!(glob_match("*", "anything"));
+    }
+
+    #[test]
+    fn filtered_pairs_keeps_base_and_allowlisted() {
+        let mut m = std::collections::HashMap::new();
+        m.insert("PATH".to_string(), "/bin".to_string());
+        m.insert("ANTHROPIC_API_KEY".to_string(), "sk".to_string());
+        m.insert("AWS_SECRET_ACCESS_KEY".to_string(), "leak".to_string());
+        let env = Env(std::sync::Arc::new(m));
+        let allow = vec!["ANTHROPIC_*".to_string()];
+        let pairs: std::collections::HashMap<_, _> =
+            env.filtered_pairs(Some(&allow)).into_iter().collect();
+        assert!(pairs.contains_key("PATH")); // base set always passed
+        assert!(pairs.contains_key("ANTHROPIC_API_KEY")); // allowlisted
+        assert!(!pairs.contains_key("AWS_SECRET_ACCESS_KEY")); // filtered out
+        // None = no filtering
+        assert_eq!(env.filtered_pairs(None).len(), 3);
     }
 }

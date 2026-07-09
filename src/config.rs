@@ -32,6 +32,19 @@ pub struct Server {
     /// is used instead.
     #[serde(default = "default_env_capture_timeout")]
     pub env_capture_timeout_secs: u64,
+    /// S-1: enable bearer-token auth. When true, a 32-byte token is generated
+    /// to ~/.tmuxlet/token (0600) unless `auth_token_env` is set.
+    #[serde(default)]
+    pub auth: bool,
+    /// S-1: read the token from this env var (wins over the token file).
+    #[serde(default)]
+    pub auth_token_env: Option<String>,
+    /// S-3: server-level default env allowlist for spawned backends (globs).
+    #[serde(default)]
+    pub env_pass: Option<Vec<String>>,
+    /// S-5: cap on a single upstream response body.
+    #[serde(default = "default_max_response_bytes")]
+    pub max_response_bytes: u64,
 }
 
 fn default_timeout() -> u64 {
@@ -45,6 +58,9 @@ fn default_log_level() -> String {
 }
 fn default_env_capture_timeout() -> u64 {
     15
+}
+fn default_max_response_bytes() -> u64 {
+    64 * 1024 * 1024
 }
 
 #[derive(Debug, Deserialize)]
@@ -65,6 +81,10 @@ pub enum Backend {
         /// accept an empty completion as success.
         #[serde(default)]
         allow_empty: bool,
+        /// S-3: env allowlist for the spawned child (globs); overrides the
+        /// server-level default.
+        #[serde(default)]
+        env_pass: Option<Vec<String>>,
     },
     Api {
         base_url: String,
@@ -93,6 +113,14 @@ pub enum Backend {
         pty_size: Option<Vec<u16>>,
         #[serde(default)]
         allow_empty: bool,
+        /// S-3: env allowlist for the spawned child (globs); overrides the
+        /// server-level default.
+        #[serde(default)]
+        env_pass: Option<Vec<String>>,
+        /// S-4: write the prompt to the child's stdin instead of argv (plain
+        /// mode; a `{prompt}` placeholder still takes precedence).
+        #[serde(default)]
+        stdin_prompt: bool,
     },
 }
 
@@ -214,9 +242,20 @@ const SERVER_KEYS: &[&str] = &[
     "env_source",
     "log_level",
     "env_capture_timeout_secs",
+    "auth",
+    "auth_token_env",
+    "env_pass",
+    "max_response_bytes",
 ];
 const CHAIN_KEYS: &[&str] = &["order"];
-const TMUXLET_KEYS: &[&str] = &["type", "target", "target_args", "cwd", "allow_empty"];
+const TMUXLET_KEYS: &[&str] = &[
+    "type",
+    "target",
+    "target_args",
+    "cwd",
+    "allow_empty",
+    "env_pass",
+];
 const API_KEYS: &[&str] = &[
     "type",
     "base_url",
@@ -234,6 +273,8 @@ const CLI_KEYS: &[&str] = &[
     "cwd",
     "pty_size",
     "allow_empty",
+    "env_pass",
+    "stdin_prompt",
 ];
 
 /// Walk the parsed TOML table one level deep per known section and report keys

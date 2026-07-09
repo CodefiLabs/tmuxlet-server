@@ -69,6 +69,11 @@ pub struct State {
     /// P-3: runtime backends built once at startup (with F-4 path resolution),
     /// keyed by name; shared read-only across workers.
     pub backends: HashMap<String, Backend>,
+    /// S-1: expected bearer token; None disables auth.
+    pub auth_token: Option<String>,
+    /// S-6: redact per-backend error detail in client responses (true when
+    /// bound non-loopback).
+    pub redact_errors: bool,
 }
 
 fn header(name: &str, value: &str) -> Header {
@@ -98,7 +103,29 @@ pub fn handle(mut req: Request, state: &Arc<State>) {
         _ => "OTHER",
     };
     let path = req.url().split('?').next().unwrap_or("").to_string();
-    match classify(method, &path) {
+    let auth_header = req
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Authorization"))
+        .map(|h| h.value.as_str().to_string());
+    let route = classify(method, &path);
+    // S-1: gate protected routes; /health stays open for liveness probes.
+    if let Some(token) = &state.auth_token
+        && matches!(route, Route::Models | Route::Chat)
+        && !crate::auth::check_bearer(auth_header.as_deref(), token)
+    {
+        eprintln!(
+            "[warn] 401 on {path}: token mismatch — the expected token is in ~/.tmuxlet/token (or the auth_token_env var)"
+        );
+        return respond_err(
+            req,
+            401,
+            "missing or invalid bearer token",
+            "invalid_request_error",
+            Some("unauthorized"),
+        );
+    }
+    match route {
         Route::Health => {
             let body = format!(
                 "{{\"status\":\"ok\",\"backends\":{},\"chains\":{}}}",
@@ -267,7 +294,17 @@ fn handle_chat(req: Request, raw: &str, state: &Arc<State>) {
         .map(|e| format!("{} ({})", e.backend_name(), e.class()))
         .collect::<Vec<_>>()
         .join(", ");
-    let details: Vec<String> = errors.iter().map(|e| e.to_string()).collect();
+    // S-6: on a non-loopback bind, redact per-backend detail (paths, errno) to
+    // name + class; on loopback keep full detail (the operator debugging with
+    // curl is the same person who reads the log). Full detail always logs.
+    let details: Vec<String> = if state.redact_errors {
+        errors
+            .iter()
+            .map(|e| format!("{} ({})", e.backend_name(), e.class()))
+            .collect()
+    } else {
+        errors.iter().map(|e| e.to_string()).collect()
+    };
     let body = openai::ErrorEnvelope::with_details(
         format!("all backends failed: {summary}"),
         "server_error",

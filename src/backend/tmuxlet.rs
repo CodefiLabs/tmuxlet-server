@@ -58,16 +58,32 @@ pub fn dispatch(
     env: &Env,
     timeout: Duration,
 ) -> Result<DispatchResult, BackendError> {
-    let args = build_args(b, prompt, timeout.as_secs());
+    let use_stdin = b.use_stdin;
+    // S-4: when the installed tmuxlet supports it, pass the prompt via stdin
+    // (`-p ... -`) instead of argv (which is ps-visible and E2BIG-prone for
+    // large transcripts). Otherwise the prompt is the final positional.
+    let positional = if use_stdin { "-" } else { prompt };
+    let args = build_args(b, positional, timeout.as_secs());
     let mut child = Command::new(&b.bin)
         .args(&args)
         .env_clear()
-        .envs(env.as_pairs())
-        .stdin(Stdio::null())
+        .envs(env.filtered_pairs(b.env_pass.as_deref()))
+        .stdin(if use_stdin {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| BackendError::Spawn(b.name.clone(), e.to_string()))?;
+    if use_stdin && let Some(mut si) = child.stdin.take() {
+        let payload = prompt.to_string();
+        thread::spawn(move || {
+            use std::io::Write;
+            let _ = si.write_all(payload.as_bytes());
+        });
+    }
 
     let mut out = child.stdout.take().unwrap();
     let mut err = child.stderr.take().unwrap();
@@ -136,6 +152,8 @@ mod tests {
             target_args: vec!["--effort".into(), "max".into()],
             cwd: PathBuf::from("/tmp"),
             allow_empty: false,
+            env_pass: None,
+            use_stdin: false,
         }
     }
 
