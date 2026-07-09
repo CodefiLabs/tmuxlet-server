@@ -110,3 +110,58 @@ fn wrong_method_on_known_path_is_405_with_allow_header() {
     assert_eq!(chat_status, 405, "GET /v1/chat/completions should be 405");
     assert_eq!(chat_allow.as_deref(), Some("POST"), "Allow should be POST");
 }
+
+fn echo_config(port: u16, prompt_mode: &str) -> String {
+    // /bin/echo echoes the shaped prompt as argv, so the completion content is
+    // exactly what the backend received — lets us assert U-14 shaping end-to-end.
+    format!(
+        r#"
+[server]
+listen = "127.0.0.1:{port}"
+default_chain = "default"
+env_source = "process"
+
+[backends.echo]
+type = "cli"
+bin = "/bin/echo"
+prompt_mode = "{prompt_mode}"
+
+[chains.default]
+order = ["echo"]
+"#
+    )
+}
+
+#[test]
+fn prompt_mode_last_user_sends_verbatim_without_role_labels() {
+    // U-14: last_user shaping drops "System:"/"User:" labels and the assistant turn.
+    let server = common::start(&echo_config(common::free_port(), "last_user"));
+    let (status, body) = common::post_json(
+        &format!("{}/v1/chat/completions", server.base),
+        r#"{"model":"default","messages":[{"role":"system","content":"be terse"},{"role":"user","content":"hi"},{"role":"assistant","content":"prev"},{"role":"user","content":"final ask"}]}"#,
+    );
+    assert_eq!(status, 200, "body: {body}");
+    assert!(body.contains("final ask"), "missing user text: {body}");
+    assert!(body.contains("be terse"), "missing system text: {body}");
+    assert!(
+        !body.contains("User:"),
+        "last_user must not label roles: {body}"
+    );
+    assert!(
+        !body.contains("Assistant:"),
+        "last_user drops the assistant turn: {body}"
+    );
+}
+
+#[test]
+fn prompt_mode_transcript_is_the_default_shaping() {
+    // U-14: default (transcript) keeps role labels, unified to "User:"/"System:".
+    let server = common::start(&echo_config(common::free_port(), "transcript"));
+    let (status, body) = common::post_json(
+        &format!("{}/v1/chat/completions", server.base),
+        r#"{"model":"default","messages":[{"role":"system","content":"S"},{"role":"user","content":"U"}]}"#,
+    );
+    assert_eq!(status, 200, "body: {body}");
+    assert!(body.contains("System: S"), "body: {body}");
+    assert!(body.contains("User: U"), "body: {body}");
+}

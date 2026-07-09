@@ -73,7 +73,7 @@ pub fn flatten_to_prompt(messages: &[ChatMessage]) -> String {
     let mut blocks = Vec::with_capacity(messages.len());
     for m in messages {
         let label = match m.role.as_str() {
-            "system" => "[System]".to_string(),
+            "system" => "System".to_string(),
             "user" => "User".to_string(),
             "assistant" => "Assistant".to_string(),
             other => {
@@ -97,6 +97,44 @@ pub fn last_user_text(messages: &[ChatMessage]) -> String {
         .find(|m| m.role == "user")
         .map(|m| content_to_text(&m.content))
         .unwrap_or_default()
+}
+
+/// U-14: how a backend shapes the request into a single prompt string.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum PromptMode {
+    /// Full role-labeled transcript (default; current behavior).
+    #[default]
+    Transcript,
+    /// Final user message verbatim, system messages prepended plainly.
+    LastUser,
+}
+
+impl PromptMode {
+    /// Parse a config string; `None` for unknown values (validate() reports them).
+    pub fn parse(s: &str) -> Option<PromptMode> {
+        match s {
+            "transcript" => Some(PromptMode::Transcript),
+            "last_user" => Some(PromptMode::LastUser),
+            _ => None,
+        }
+    }
+}
+
+/// U-14 `last_user` shaping: the final user message verbatim, with any system
+/// messages prepended plainly (no role labels) so coding CLIs see the prompt
+/// they'd get from a direct invocation.
+pub fn last_user_prompt(messages: &[ChatMessage]) -> String {
+    let mut parts: Vec<String> = messages
+        .iter()
+        .filter(|m| m.role == "system")
+        .map(|m| content_to_text(&m.content))
+        .filter(|s| !s.trim().is_empty())
+        .collect();
+    let user = last_user_text(messages);
+    if !user.is_empty() {
+        parts.push(user);
+    }
+    parts.join("\n\n")
 }
 
 // ---------- Non-streaming response ----------
@@ -352,7 +390,20 @@ mod tests {
             r#"{"model":"x","messages":[{"role":"system","content":"S"},{"role":"user","content":"U"}]}"#,
         )
         .unwrap();
-        assert_eq!(flatten_to_prompt(&req.messages), "[System]: S\n\nUser: U");
+        // U-14: labels unified — `System:` (no brackets).
+        assert_eq!(flatten_to_prompt(&req.messages), "System: S\n\nUser: U");
+    }
+
+    #[test]
+    fn last_user_prompt_prepends_system_and_drops_labels() {
+        // U-14 `last_user`: system text prepended plainly, final user verbatim.
+        let req: ChatRequest = serde_json::from_str(
+            r#"{"model":"x","messages":[{"role":"system","content":"be terse"},{"role":"user","content":"hi"},{"role":"assistant","content":"prev"},{"role":"user","content":"final ask"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(last_user_prompt(&req.messages), "be terse\n\nfinal ask");
+        assert_eq!(PromptMode::parse("last_user"), Some(PromptMode::LastUser));
+        assert_eq!(PromptMode::parse("nope"), None);
     }
 
     #[test]

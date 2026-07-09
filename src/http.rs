@@ -360,6 +360,7 @@ fn handle_chat(req: Request, raw: &str, state: &Arc<State>) {
     };
 
     let prompt = openai::flatten_to_prompt(&parsed.messages);
+    let last_user = openai::last_user_prompt(&parsed.messages); // U-14
     let default_to = Duration::from_secs(state.cfg.server.request_timeout_secs);
 
     if parsed.stream {
@@ -368,6 +369,7 @@ fn handle_chat(req: Request, raw: &str, state: &Arc<State>) {
             state,
             names_owned,
             prompt,
+            last_user,
             raw_value,
             default_to,
             route_label,
@@ -377,7 +379,9 @@ fn handle_chat(req: Request, raw: &str, state: &Arc<State>) {
     }
 
     let names_ref: Vec<&str> = names_owned.iter().map(|s| s.as_str()).collect();
-    match run_chain(state, &names_ref, &prompt, &raw_value, default_to, &reqid) {
+    match run_chain(
+        state, &names_ref, &prompt, &last_user, &raw_value, default_to, &reqid,
+    ) {
         Ok(result) => {
             let id = format!("chatcmpl-{}", result.model_label);
             let body = serde_json::to_string(&openai::build_completion(
@@ -406,6 +410,7 @@ fn stream_with_keepalive(
     state: &Arc<State>,
     names: Vec<String>,
     prompt: String,
+    last_user: String,
     raw_value: serde_json::Value,
     default_to: Duration,
     route_label: Option<String>,
@@ -422,6 +427,7 @@ fn stream_with_keepalive(
             &state_dispatch,
             &names_ref,
             &prompt,
+            &last_user,
             &raw_value,
             default_to,
             &reqid2,
@@ -483,6 +489,7 @@ fn run_chain(
     state: &State,
     names: &[&str],
     prompt: &str,
+    last_user: &str,
     raw_value: &serde_json::Value,
     default_to: Duration,
     reqid: &str,
@@ -554,7 +561,11 @@ fn run_chain(
             None => leg_to,
         };
         let leg_start = Instant::now();
-        let result = backend.dispatch(prompt, raw_value, &state.env, timeout);
+        let leg_prompt = match backend.prompt_mode() {
+            openai::PromptMode::LastUser => last_user,
+            openai::PromptMode::Transcript => prompt,
+        };
+        let result = backend.dispatch(leg_prompt, raw_value, &state.env, timeout);
         let elapsed_ms = leg_start.elapsed().as_millis() as u64;
         if has_cap.is_some() {
             let mut active = state.active.lock().unwrap();

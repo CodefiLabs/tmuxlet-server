@@ -94,6 +94,8 @@ pub struct TmuxletBackend {
     pub use_stdin: bool,
     /// U-20: max simultaneous dispatches (None = unlimited).
     pub max_concurrent: Option<usize>,
+    /// U-14: prompt shaping mode.
+    pub prompt_mode: crate::openai::PromptMode,
 }
 
 pub struct ApiBackend {
@@ -125,6 +127,8 @@ pub struct CliBackend {
     pub stdin_prompt: bool,
     /// U-20: max simultaneous dispatches (None = unlimited).
     pub max_concurrent: Option<usize>,
+    /// U-14: prompt shaping mode.
+    pub prompt_mode: crate::openai::PromptMode,
 }
 
 pub enum Backend {
@@ -179,6 +183,7 @@ impl Backend {
                 allow_empty,
                 env_pass,
                 max_concurrent,
+                prompt_mode,
             } => Backend::Tmuxlet(TmuxletBackend {
                 name: name.into(),
                 bin: resolve_program("tmuxlet", env),
@@ -189,6 +194,10 @@ impl Backend {
                 env_pass: resolve_env_pass(env_pass),
                 use_stdin: defaults.tmuxlet_stdin,
                 max_concurrent: *max_concurrent,
+                prompt_mode: prompt_mode
+                    .as_deref()
+                    .and_then(crate::openai::PromptMode::parse)
+                    .unwrap_or_default(),
             }),
             config::Backend::Api {
                 base_url,
@@ -219,6 +228,7 @@ impl Backend {
                 env_pass,
                 stdin_prompt,
                 max_concurrent,
+                prompt_mode,
             } => Backend::Cli(CliBackend {
                 name: name.into(),
                 bin: PathBuf::from(bin),
@@ -234,6 +244,10 @@ impl Backend {
                 env_pass: resolve_env_pass(env_pass),
                 stdin_prompt: *stdin_prompt,
                 max_concurrent: *max_concurrent,
+                prompt_mode: prompt_mode
+                    .as_deref()
+                    .and_then(crate::openai::PromptMode::parse)
+                    .unwrap_or_default(),
             }),
         }
     }
@@ -272,6 +286,15 @@ impl Backend {
             Backend::Tmuxlet(b) => b.max_concurrent,
             Backend::Api(b) => b.max_concurrent,
             Backend::Cli(b) => b.max_concurrent,
+        }
+    }
+
+    /// U-14: prompt shaping mode (api backends pass raw JSON, so Transcript).
+    pub fn prompt_mode(&self) -> crate::openai::PromptMode {
+        match self {
+            Backend::Tmuxlet(b) => b.prompt_mode,
+            Backend::Cli(b) => b.prompt_mode,
+            Backend::Api(_) => crate::openai::PromptMode::Transcript,
         }
     }
 

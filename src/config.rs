@@ -135,6 +135,9 @@ pub enum Backend {
         /// U-20: max simultaneous dispatches to this backend.
         #[serde(default)]
         max_concurrent: Option<usize>,
+        /// U-14: prompt shaping — "transcript" (default) | "last_user".
+        #[serde(default)]
+        prompt_mode: Option<String>,
     },
     Api {
         base_url: String,
@@ -177,6 +180,9 @@ pub enum Backend {
         /// U-20: max simultaneous dispatches to this backend.
         #[serde(default)]
         max_concurrent: Option<usize>,
+        /// U-14: prompt shaping — "transcript" (default) | "last_user".
+        #[serde(default)]
+        prompt_mode: Option<String>,
     },
 }
 
@@ -313,6 +319,20 @@ pub fn lint(cfg: &Config, text: &str) -> Vec<String> {
                 ps.len()
             ));
         }
+        // U-14: prompt_mode, if set, must be transcript | last_user.
+        let pm = match b {
+            Backend::Cli { prompt_mode, .. } | Backend::Tmuxlet { prompt_mode, .. } => {
+                prompt_mode.as_deref()
+            }
+            _ => None,
+        };
+        if let Some(m) = pm
+            && crate::openai::PromptMode::parse(m).is_none()
+        {
+            out.push(format!(
+                "backends.{bname}.prompt_mode '{m}' is neither 'transcript' nor 'last_user' — using 'transcript'"
+            ));
+        }
     }
 
     out
@@ -347,6 +367,7 @@ const TMUXLET_KEYS: &[&str] = &[
     "allow_empty",
     "env_pass",
     "max_concurrent",
+    "prompt_mode",
 ];
 const API_KEYS: &[&str] = &[
     "type",
@@ -369,6 +390,7 @@ const CLI_KEYS: &[&str] = &[
     "env_pass",
     "stdin_prompt",
     "max_concurrent",
+    "prompt_mode",
 ];
 const ROUTER_KEYS: &[&str] = &[
     "classifier",

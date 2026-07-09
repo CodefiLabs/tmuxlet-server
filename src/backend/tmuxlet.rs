@@ -155,6 +155,7 @@ mod tests {
             env_pass: None,
             use_stdin: false,
             max_concurrent: None,
+            prompt_mode: crate::openai::PromptMode::Transcript,
         }
     }
 
