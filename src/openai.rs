@@ -47,14 +47,25 @@ pub enum ContentPart {
 fn content_to_text(c: &MessageContent) -> String {
     match c {
         MessageContent::Text(s) => s.clone(),
-        MessageContent::Parts(ps) => ps
-            .iter()
-            .filter_map(|p| match p {
-                ContentPart::Text { text } => Some(text.as_str()),
-                ContentPart::Other => None,
-            })
-            .collect::<Vec<_>>()
-            .join(""),
+        MessageContent::Parts(ps) => {
+            // U-15: join text parts with `\n` (not `""`, which glues words), and
+            // surface dropped non-text parts (images) rather than losing them
+            // silently.
+            let mut texts = Vec::new();
+            let mut dropped = 0usize;
+            for p in ps {
+                match p {
+                    ContentPart::Text { text } => texts.push(text.as_str()),
+                    ContentPart::Other => dropped += 1,
+                }
+            }
+            if dropped > 0 {
+                eprintln!(
+                    "[warn] dropped {dropped} non-text content part(s) (image/other) from a message; only text is forwarded"
+                );
+            }
+            texts.join("\n")
+        }
     }
 }
 
@@ -248,6 +259,11 @@ pub struct ApiError {
     pub error_type: String,
     pub param: Option<String>,
     pub code: Option<String>,
+    /// U-23: full per-leg error strings for a 503; omitted when empty. The
+    /// OpenAI envelope tolerates extra fields, and clients that render only
+    /// `message` still get the compact summary.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub details: Vec<String>,
 }
 
 impl ErrorEnvelope {
@@ -258,8 +274,20 @@ impl ErrorEnvelope {
                 error_type: error_type.into(),
                 param: None,
                 code: code.map(|s| s.to_string()),
+                details: Vec::new(),
             },
         }
+    }
+    /// U-23: like `new`, but attaches the full per-leg error strings.
+    pub fn with_details(
+        message: impl Into<String>,
+        error_type: &str,
+        code: Option<&str>,
+        details: Vec<String>,
+    ) -> Self {
+        let mut e = Self::new(message, error_type, code);
+        e.error.details = details;
+        e
     }
     pub fn to_json(&self) -> String {
         serde_json::to_string(self).unwrap()
@@ -281,6 +309,31 @@ mod tests {
         assert!(a.stream);
         assert!(!b.stream);
         assert!(a.extra.contains_key("seed"));
+    }
+
+    #[test]
+    fn multipart_text_joined_with_newlines() {
+        let c: MessageContent = serde_json::from_str(
+            r#"[{"type":"text","text":"a"},{"type":"image_url","image_url":{"url":"x"}},{"type":"text","text":"b"}]"#,
+        )
+        .unwrap();
+        assert_eq!(content_to_text(&c), "a\nb");
+    }
+
+    #[test]
+    fn error_envelope_with_details_serializes_array() {
+        let j = ErrorEnvelope::with_details(
+            "summary",
+            "server_error",
+            Some("all_backends_failed"),
+            vec!["[a] x".into(), "[b] y".into()],
+        )
+        .to_json();
+        assert!(j.contains("\"details\":["));
+        assert!(j.contains("summary"));
+        // empty details omit the field
+        let j2 = ErrorEnvelope::new("m", "t", None).to_json();
+        assert!(!j2.contains("details"));
     }
 
     #[test]

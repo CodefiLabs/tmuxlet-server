@@ -51,6 +51,23 @@ pub fn extract_content(name: &str, resp: &str) -> Result<String, BackendError> {
         .ok_or_else(|| BackendError::Parse(name.into(), "no choices[0].message.content".into()))
 }
 
+/// U-7: condense an upstream error body to a single-line, control-stripped
+/// snippet (first 300 chars) so the user sees the upstream's actual message
+/// ("invalid key", "out of credits", "unknown model") instead of a bare status.
+fn error_snippet(body: &str) -> String {
+    let spaced: String = body
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    spaced
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(300)
+        .collect()
+}
+
 /// Forward to an OpenAI-compatible HTTP upstream: build the merged body, POST
 /// it, then re-extract `choices[0].message.content`. Non-2xx becomes an Http
 /// error so the chain falls through to the next backend.
@@ -78,7 +95,11 @@ pub fn dispatch(
     )
     .map_err(|e| BackendError::Spawn(b.name.clone(), e.to_string()))?;
     if !(200..300).contains(&status) {
-        return Err(BackendError::Http(b.name.clone(), status));
+        return Err(BackendError::Http(
+            b.name.clone(),
+            status,
+            error_snippet(&resp),
+        ));
     }
     let content = extract_content(&b.name, &resp)?;
     Ok(DispatchResult {
@@ -123,5 +144,12 @@ mod tests {
     fn extracts_content_from_completion() {
         let r = r#"{"choices":[{"message":{"content":"hello"}}]}"#;
         assert_eq!(extract_content("api", r).unwrap(), "hello");
+    }
+
+    #[test]
+    fn error_snippet_condenses_body() {
+        let s = error_snippet("  {\n  \"error\": \"bad key\"\n}\t");
+        assert_eq!(s, "{ \"error\": \"bad key\" }");
+        assert!(error_snippet(&"x".repeat(500)).chars().count() <= 300);
     }
 }

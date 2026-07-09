@@ -1,8 +1,9 @@
-use crate::backend::Backend;
-use crate::config::{self, Config};
+use crate::backend::{Backend, BackendError};
+use crate::config::Config;
 use crate::env::Env;
 use crate::{openai, router};
-use std::collections::VecDeque;
+use serde::Deserialize;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read};
 use std::sync::Arc;
 use std::time::Duration;
@@ -65,6 +66,9 @@ impl Read for SseBody {
 pub struct State {
     pub cfg: Config,
     pub env: Env,
+    /// P-3: runtime backends built once at startup (with F-4 path resolution),
+    /// keyed by name; shared read-only across workers.
+    pub backends: HashMap<String, Backend>,
 }
 
 fn header(name: &str, value: &str) -> Header {
@@ -104,12 +108,13 @@ pub fn handle(mut req: Request, state: &Arc<State>) {
             respond_json(req, 200, body);
         }
         Route::Models => {
-            let ids = state
-                .cfg
-                .chains
-                .keys()
-                .chain(state.cfg.backends.keys())
-                .cloned();
+            // U-9: deterministic order — chains first, then backends, each
+            // sorted alphabetically (HashMap iteration order changes per run).
+            let mut chain_ids: Vec<String> = state.cfg.chains.keys().cloned().collect();
+            chain_ids.sort();
+            let mut backend_ids: Vec<String> = state.cfg.backends.keys().cloned().collect();
+            backend_ids.sort();
+            let ids = chain_ids.into_iter().chain(backend_ids);
             respond_json(
                 req,
                 200,
@@ -164,7 +169,21 @@ pub fn handle(mut req: Request, state: &Arc<State>) {
 }
 
 fn handle_chat(req: Request, raw: &str, state: &Arc<State>) {
-    let parsed: openai::ChatRequest = match serde_json::from_str(raw) {
+    // P-2: parse the body once to a Value, then deserialize the typed view from
+    // it (the api backend forwards the Value verbatim).
+    let raw_value: serde_json::Value = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(e) => {
+            return respond_err(
+                req,
+                400,
+                &format!("parse error: {e}"),
+                "invalid_request_error",
+                Some("parse_error"),
+            );
+        }
+    };
+    let parsed: openai::ChatRequest = match openai::ChatRequest::deserialize(&raw_value) {
         Ok(p) => p,
         Err(e) => {
             return respond_err(
@@ -191,22 +210,24 @@ fn handle_chat(req: Request, raw: &str, state: &Arc<State>) {
         Err(e) => return respond_err(req, 400, &e, "invalid_request_error", Some("bad_model")),
     };
     let prompt = openai::flatten_to_prompt(&parsed.messages);
-    let raw_value: serde_json::Value = serde_json::from_str(raw).unwrap_or(serde_json::json!({}));
     let default_to = Duration::from_secs(state.cfg.server.request_timeout_secs);
 
-    let mut errors = Vec::new();
+    let mut errors: Vec<BackendError> = Vec::new();
     for &name in &names {
-        let cfg_backend = &state.cfg.backends[name];
-        let timeout = match cfg_backend {
-            config::Backend::Api {
-                timeout_secs: Some(t),
-                ..
-            } => Duration::from_secs(*t),
-            _ => default_to,
-        };
-        let backend = Backend::from_config(name, cfg_backend);
+        // P-3: reuse the prebuilt runtime backend instead of rebuilding it.
+        let backend = &state.backends[name];
+        let timeout = backend.timeout_override().unwrap_or(default_to);
         match backend.dispatch(&prompt, &raw_value, &state.env, timeout) {
             Ok(result) => {
+                // U-6: an empty completion ends the chain with a working answer
+                // unused; treat it as a failure so the chain advances (unless the
+                // backend opts in with allow_empty).
+                if result.content.trim().is_empty() && !backend.allow_empty() {
+                    let e = BackendError::Backend(name.to_string(), "empty output".into());
+                    eprintln!("[skip] {e}");
+                    errors.push(e);
+                    continue;
+                }
                 eprintln!("[ok] {name}");
                 let id = format!("chatcmpl-{}", result.model_label);
                 if parsed.stream {
@@ -235,18 +256,26 @@ fn handle_chat(req: Request, raw: &str, state: &Arc<State>) {
             }
             Err(e) => {
                 eprintln!("[skip] {e}");
-                errors.push(e.to_string());
+                errors.push(e);
             }
         }
     }
-    let detail = serde_json::to_string(&errors).unwrap_or_default();
-    respond_err(
-        req,
-        503,
-        &format!("all backends failed: {detail}"),
+    // U-23: compact human summary in `message` (chat UIs that render only
+    // `message` stay debuggable); full per-leg strings in `error.details`.
+    let summary = errors
+        .iter()
+        .map(|e| format!("{} ({})", e.backend_name(), e.class()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let details: Vec<String> = errors.iter().map(|e| e.to_string()).collect();
+    let body = openai::ErrorEnvelope::with_details(
+        format!("all backends failed: {summary}"),
         "server_error",
         Some("all_backends_failed"),
-    );
+        details,
+    )
+    .to_json();
+    respond_json(req, 503, body);
 }
 
 pub fn serve(server: Arc<Server>, state: Arc<State>, workers: usize) {
@@ -256,7 +285,20 @@ pub fn serve(server: Arc<Server>, state: Arc<State>, workers: usize) {
         let state = Arc::clone(&state);
         handles.push(std::thread::spawn(move || {
             while let Ok(req) = server.recv() {
-                handle(req, &state);
+                // F-3: a panic while handling one request must not tear down the
+                // worker (which would silently shrink capacity). Recover and
+                // keep serving. The panicking request's socket is dropped.
+                let st = &state;
+                let result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle(req, st)));
+                if let Err(p) = result {
+                    let msg = p
+                        .downcast_ref::<&str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| p.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "unknown panic".into());
+                    eprintln!("[error] worker recovered from panic: {msg}");
+                }
             }
         }));
     }

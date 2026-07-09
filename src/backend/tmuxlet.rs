@@ -59,7 +59,7 @@ pub fn dispatch(
     timeout: Duration,
 ) -> Result<DispatchResult, BackendError> {
     let args = build_args(b, prompt, timeout.as_secs());
-    let mut child = Command::new("tmuxlet")
+    let mut child = Command::new(&b.bin)
         .args(&args)
         .env_clear()
         .envs(env.as_pairs())
@@ -131,9 +131,11 @@ mod tests {
     fn b() -> TmuxletBackend {
         TmuxletBackend {
             name: "t".into(),
+            bin: PathBuf::from("tmuxlet"),
             target: "claude".into(),
             target_args: vec!["--effort".into(), "max".into()],
             cwd: PathBuf::from("/tmp"),
+            allow_empty: false,
         }
     }
 

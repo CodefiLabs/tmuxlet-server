@@ -43,7 +43,7 @@ pub fn plain_args(b: &CliBackend, prompt: &str) -> Vec<String> {
 /// Run the CLI backend and return cleaned output. `pty=true` runs the binary in
 /// a PTY (for TUI tools like agy); `pty=false` uses a plain piped child guarded
 /// by a try_wait watchdog. Either way the output is stripped of ANSI/control
-/// bytes via `pty::clean_output`.
+/// bytes via `pty::clean_output`. Both modes run in `b.cwd` (U-11).
 pub fn dispatch(
     b: &CliBackend,
     prompt: &str,
@@ -56,15 +56,23 @@ pub fn dispatch(
         // Otherwise the prompt is written to the child's stdin, as before.
         let (pty_args, substituted) = substitute_prompt(&b.args, prompt);
         let stdin_payload = if substituted { "" } else { prompt };
-        let (raw, status) = pty::run_in_pty(
+        let (cols, rows) = b.pty_size;
+        let (raw, status, timed_out) = pty::run_in_pty(
             &b.bin.display().to_string(),
             &pty_args,
             &env.as_pairs(),
-            &std::env::var("HOME").unwrap_or_else(|_| ".".into()),
+            &b.cwd.display().to_string(),
             stdin_payload,
+            cols,
+            rows,
             timeout,
         )
-        .map_err(|e| BackendError::Spawn(b.name.clone(), e.to_string()))?;
+        .map_err(|e| BackendError::Spawn(b.name.clone(), e))?;
+        // F-1: a watchdog kill is a timeout, even if partial output was
+        // captured — never ship a truncated answer as success; the chain advances.
+        if timed_out {
+            return Err(BackendError::Timeout(b.name.clone()));
+        }
         let cleaned = pty::clean_output(&raw);
         // A non-zero exit with no usable output is a failure, so the fallback
         // chain advances to the next backend (mirrors the non-PTY branch).
@@ -79,6 +87,7 @@ pub fn dispatch(
     } else {
         let mut child = Command::new(&b.bin)
             .args(plain_args(b, prompt))
+            .current_dir(&b.cwd)
             .env_clear()
             .envs(env.as_pairs())
             .stdin(Stdio::null())
@@ -145,14 +154,21 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    fn cli(name: &str, bin: &str, args: Vec<String>, pty: bool) -> CliBackend {
+        CliBackend {
+            name: name.into(),
+            bin: PathBuf::from(bin),
+            args,
+            pty,
+            cwd: PathBuf::from("/tmp"),
+            pty_size: (200, 50),
+            allow_empty: false,
+        }
+    }
+
     #[test]
     fn plain_args_append_prompt() {
-        let b = CliBackend {
-            name: "x".into(),
-            bin: PathBuf::from("/bin/echo"),
-            args: vec!["-n".into()],
-            pty: false,
-        };
+        let b = cli("x", "/bin/echo", vec!["-n".into()], false);
         assert_eq!(
             plain_args(&b, "hello"),
             vec!["-n".to_string(), "hello".to_string()]
@@ -163,12 +179,12 @@ mod tests {
     fn plain_args_substitutes_placeholder_instead_of_appending() {
         // When `{prompt}` appears in args, the prompt is substituted there and
         // NOT also appended as a trailing positional (which would double it).
-        let b = CliBackend {
-            name: "x".into(),
-            bin: PathBuf::from("/bin/echo"),
-            args: vec!["-p".into(), "{prompt}".into()],
-            pty: false,
-        };
+        let b = cli(
+            "x",
+            "/bin/echo",
+            vec!["-p".into(), "{prompt}".into()],
+            false,
+        );
         assert_eq!(
             plain_args(&b, "hello world"),
             vec!["-p".to_string(), "hello world".to_string()]
@@ -179,13 +195,8 @@ mod tests {
     fn pty_dispatch_substitutes_placeholder_into_argv() {
         // A PTY tool whose flag takes the prompt as its value (like agy's
         // `-p <prompt>`) must receive the prompt in argv, not on stdin.
-        let b = CliBackend {
-            name: "echoer".into(),
-            bin: PathBuf::from("/bin/echo"),
-            args: vec!["{prompt}".into()],
-            pty: true,
-        };
-        let env = Env::capture("process", "");
+        let b = cli("echoer", "/bin/echo", vec!["{prompt}".into()], true);
+        let env = Env::capture("process", "", 5);
         let r = dispatch(&b, "READYTOKEN", &env, Duration::from_secs(10)).unwrap();
         assert_eq!(r.content.trim(), "READYTOKEN");
     }
@@ -195,13 +206,13 @@ mod tests {
         // The fallback chain advances only if a failed backend surfaces as an
         // error. Use the `{prompt}` placeholder so the prompt goes to argv and
         // stdin stays empty (no PTY echo); `exit 1` then produces no output.
-        let b = CliBackend {
-            name: "failer".into(),
-            bin: PathBuf::from("/bin/sh"),
-            args: vec!["-c".into(), "exit 1".into(), "{prompt}".into()],
-            pty: true,
-        };
-        let env = Env::capture("process", "");
+        let b = cli(
+            "failer",
+            "/bin/sh",
+            vec!["-c".into(), "exit 1".into(), "{prompt}".into()],
+            true,
+        );
+        let env = Env::capture("process", "", 5);
         let err = dispatch(&b, "anything", &env, Duration::from_secs(10)).unwrap_err();
         assert!(
             matches!(err, BackendError::Exit(ref n, _, _) if n == "failer"),

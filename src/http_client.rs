@@ -63,15 +63,53 @@ fn connect(host: &str, port: u16, timeout: Duration) -> io::Result<TcpStream> {
     Ok(tcp)
 }
 
-/// Read to EOF, tolerating an unclean close: TLS peers and some HTTP servers
-/// drop the connection without a close_notify / clean FIN once the body is
-/// sent (rustls 0.23 surfaces this as `UnexpectedEof`). A genuine stall instead
-/// surfaces as `WouldBlock`/`TimedOut` and IS propagated.
+/// Read one HTTP response body into `buf`.
+///
+/// F-5: when the response carries a `Content-Length`, stop reading once exactly
+/// that many body bytes have arrived — a server that ignores our
+/// `Connection: close` and holds the socket open would otherwise stall us until
+/// the read timeout and cause a false failure / needless fallback. Chunked and
+/// close-delimited responses read to EOF (unchanged).
+///
+/// Tolerates an unclean close: TLS peers and some HTTP servers drop the
+/// connection without a close_notify / clean FIN once the body is sent (rustls
+/// 0.23 surfaces this as `UnexpectedEof`). A genuine stall instead surfaces as
+/// `WouldBlock`/`TimedOut` and IS propagated.
 fn read_body<R: Read>(r: &mut R, buf: &mut Vec<u8>) -> io::Result<()> {
-    match r.read_to_end(buf) {
-        Ok(_) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(()),
-        Err(e) => Err(e),
+    let mut chunk = [0u8; 8192];
+    let mut header_end: Option<usize> = None;
+    let mut content_length: Option<usize> = None;
+    let mut chunked = false;
+    loop {
+        if let (Some(he), Some(cl)) = (header_end, content_length)
+            && !chunked
+            && buf.len() >= he + 4 + cl
+        {
+            buf.truncate(he + 4 + cl);
+            return Ok(());
+        }
+        match r.read(&mut chunk) {
+            Ok(0) => return Ok(()),
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if header_end.is_none()
+                    && let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n")
+                {
+                    header_end = Some(pos);
+                    let head = String::from_utf8_lossy(&buf[..pos]);
+                    for line in head.lines() {
+                        let l = line.to_ascii_lowercase();
+                        if let Some(v) = l.strip_prefix("content-length:") {
+                            content_length = v.trim().parse::<usize>().ok();
+                        } else if l.starts_with("transfer-encoding:") && l.contains("chunked") {
+                            chunked = true;
+                        }
+                    }
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(e) => return Err(e),
+        }
     }
 }
 
@@ -186,5 +224,19 @@ mod tests {
         // chunk-extension after ';' is ignored; truncated stream stops cleanly.
         assert_eq!(dechunk(b"3;foo=bar\r\nabc\r\n0\r\n\r\n"), b"abc");
         assert_eq!(dechunk(b"4\r\nab"), b"ab");
+    }
+
+    #[test]
+    fn read_body_stops_at_content_length() {
+        // A server that keeps the socket open past the body would stall us to a
+        // read timeout; Content-Length framing stops at the declared length even
+        // when trailing bytes follow.
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhelloEXTRA-BYTES-THAT-WOULD-BLOCK";
+        let mut cursor: &[u8] = raw;
+        let mut buf = Vec::new();
+        read_body(&mut cursor, &mut buf).unwrap();
+        let (status, body) = parse_response(&buf).unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(body, "hello");
     }
 }
