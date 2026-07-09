@@ -81,6 +81,7 @@ pub fn resolve(
 fn write_token(p: &Path, token: &str) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::PermissionsExt;
     // Create with 0600 from the start (no default-umask window).
     let mut f = fs::OpenOptions::new()
         .write(true)
@@ -88,6 +89,10 @@ fn write_token(p: &Path, token: &str) -> std::io::Result<()> {
         .truncate(true)
         .mode(0o600)
         .open(p)?;
+    // `.mode()` is honored only when open(2) CREATES the file; a pre-existing
+    // token file keeps its old (possibly world-readable) mode. Force 0600 so the
+    // secret is never left group/world-readable (S-1).
+    f.set_permissions(fs::Permissions::from_mode(0o600))?;
     f.write_all(token.as_bytes())
 }
 
@@ -150,6 +155,30 @@ mod tests {
             let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolve_repairs_a_world_readable_pre_existing_token_file() {
+        // S-1: open(2)'s mode arg is ignored for an existing file, so a stale
+        // 0644 token file must be forced back to 0600 when a token is written.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("tmuxlet-auth-perm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("token");
+        // Empty + world-readable: resolve() regenerates and rewrites it.
+        std::fs::write(&file, b"").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let env = Env::capture("process", "", 5);
+        let t = resolve(true, None, &env, &file).unwrap().unwrap();
+        assert_eq!(t.len(), 64);
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "token must be re-secured to 0600, got {mode:o}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

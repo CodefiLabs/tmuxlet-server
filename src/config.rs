@@ -307,6 +307,14 @@ pub fn lint(cfg: &Config, text: &str) -> Vec<String> {
         );
     }
 
+    // P-1: workers = 0 spawns no threads; serve clamps to 1, but name the fix.
+    if cfg.server.workers == Some(0) {
+        out.push(
+            "server.workers = 0 spawns no worker threads and would serve nothing — set workers >= 1 or omit the key for the default"
+                .into(),
+        );
+    }
+
     // U-5: unknown env_source value is silently treated as "shell".
     if !matches!(cfg.server.env_source.as_str(), "shell" | "process") {
         out.push(format!(
@@ -718,6 +726,18 @@ order = ["agy", "ollama-kimi", "claude-thinking"]
                 .iter()
                 .any(|w| w.contains("request_timeout_secs = 0")),
             "zero timeout: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn lint_flags_zero_workers() {
+        // P-1: workers = 0 spawns no threads; lint names the fix (serve clamps).
+        let bad = SAMPLE.replace("log_level = \"info\"", "log_level = \"info\"\nworkers = 0");
+        let cfg = parse(&bad).unwrap();
+        let warnings = lint(&cfg, &bad);
+        assert!(
+            warnings.iter().any(|w| w.contains("server.workers = 0")),
+            "zero workers not flagged: {warnings:?}"
         );
     }
 

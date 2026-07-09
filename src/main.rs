@@ -378,12 +378,18 @@ fn run_serve(config_path: &str, allow_remote: bool) -> ExitCode {
 
     // P-1: workers = configured, else max(16, cores) — the workload is blocking
     // I/O, so cores alone under-provisions (one long tmuxlet turn pins a worker).
-    let workers = cfg.server.workers.unwrap_or_else(|| {
-        let cores = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
-        cores.max(16)
-    });
+    // `.max(1)`: workers = 0 would spawn no threads and the server would bind,
+    // print "listening", then exit immediately (lint warns; serve stays alive).
+    let workers = cfg
+        .server
+        .workers
+        .unwrap_or_else(|| {
+            let cores = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4);
+            cores.max(16)
+        })
+        .max(1);
     let state = Arc::new(http::State {
         cfg,
         env: environment,

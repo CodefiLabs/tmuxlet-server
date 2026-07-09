@@ -250,3 +250,16 @@ fn cors_absent_for_unlisted_origin_and_by_default() {
         "CORS off by default: {ph:?}"
     );
 }
+
+#[test]
+fn zero_workers_is_clamped_and_still_serves() {
+    // P-1: workers = 0 must not exit the process; serve clamps to 1. If the clamp
+    // regressed, the server would exit and common::start would panic on readiness.
+    let cfg = config(common::free_port()).replace(
+        "env_source = \"process\"",
+        "env_source = \"process\"\nworkers = 0",
+    );
+    let server = common::start(&cfg);
+    let (status, _) = common::get(&format!("{}/health", server.base));
+    assert_eq!(status, 200, "clamped server must answer /health");
+}

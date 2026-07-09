@@ -740,11 +740,29 @@ fn classify_task(
     let Some(classifier) = state.backends.get(&router_cfg.classifier) else {
         return (router_cfg.fallback_class.clone(), 0);
     };
+    // U-20: honor the classifier backend's concurrency cap. At capacity, degrade
+    // to the fallback class rather than spawning an uncounted session (the same
+    // cap run_chain enforces on chain legs). Routing never fails the request.
+    let cap = classifier.max_concurrent();
+    if let Some(max) = cap {
+        let mut active = state.active.lock().unwrap();
+        let count = active.entry(router_cfg.classifier.clone()).or_insert(0);
+        if *count >= max {
+            return (router_cfg.fallback_class.clone(), 0);
+        }
+        *count += 1;
+    }
     let timeout = Duration::from_secs(router_cfg.classifier_timeout_secs);
     let raw = serde_json::json!({"messages": [{"role": "user", "content": prompt}]});
     let start = Instant::now();
     let result = classifier.dispatch(&prompt, &raw, &state.env, timeout);
     let ms = start.elapsed().as_millis() as u64;
+    if cap.is_some() {
+        let mut active = state.active.lock().unwrap();
+        if let Some(c) = active.get_mut(&router_cfg.classifier) {
+            *c = c.saturating_sub(1);
+        }
+    }
     let class = match result {
         Ok(r) => parse_class(&r.content, &router_cfg.routes, &router_cfg.fallback_class),
         Err(_) => router_cfg.fallback_class.clone(),

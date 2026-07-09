@@ -135,11 +135,16 @@ fn read_body<R: Read>(r: &mut R, buf: &mut Vec<u8>, max_bytes: usize) -> io::Res
     let mut content_length: Option<usize> = None;
     let mut chunked = false;
     loop {
+        // Saturating add: a malicious/huge Content-Length must not overflow the
+        // `he + 4 + cl` framing offset (usize::MAX would wrap and truncate the
+        // header terminator). On saturation the branch simply never fires and we
+        // fall through to read-to-EOF, returning the (short) body intact.
         if let (Some(he), Some(cl)) = (header_end, content_length)
             && !chunked
-            && buf.len() >= he + 4 + cl
+            && let Some(end) = he.checked_add(4).and_then(|x| x.checked_add(cl))
+            && buf.len() >= end
         {
-            buf.truncate(he + 4 + cl);
+            buf.truncate(end);
             return Ok(());
         }
         match r.read(&mut chunk) {
@@ -312,6 +317,23 @@ mod tests {
         let mut buf = Vec::new();
         let err = read_body(&mut cursor, &mut buf, 200).unwrap_err();
         assert!(err.to_string().contains("max_response_bytes"));
+    }
+
+    #[test]
+    fn read_body_tolerates_overflowing_content_length() {
+        // S-5: a hostile Content-Length near usize::MAX must not overflow the
+        // `he + 4 + cl` framing offset (which would corrupt/truncate the buffer
+        // or panic). The short real body is read to EOF and returned intact.
+        let raw = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{{\"ok\":1}}",
+            u64::MAX
+        );
+        let mut cursor: &[u8] = raw.as_bytes();
+        let mut buf = Vec::new();
+        read_body(&mut cursor, &mut buf, 0).unwrap();
+        let (status, body) = parse_response(&buf).unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(body, "{\"ok\":1}");
     }
 
     #[test]

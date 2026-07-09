@@ -149,12 +149,27 @@ pub fn resolve_program(program: &str, env: &Env) -> PathBuf {
     if let Some(path) = env.get("PATH") {
         for dir in path.split(':').filter(|d| !d.is_empty()) {
             let candidate = Path::new(dir).join(program);
-            if candidate.is_file() {
+            // Skip a non-executable shadow (e.g. a 0644 file named `tmuxlet`)
+            // and keep scanning, matching execvp/shell PATH semantics (F-4).
+            if is_executable_file(&candidate) {
                 return candidate;
             }
         }
     }
     PathBuf::from(program)
+}
+
+#[cfg(unix)]
+fn is_executable_file(p: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(p: &Path) -> bool {
+    p.is_file()
 }
 
 /// Server-level values threaded into each runtime backend at build time.
@@ -372,5 +387,23 @@ order = ["t"]
         let b = Backend::from_config("t", &cfg.backends["t"], &env, &defaults);
         assert_eq!(b.name(), "t");
         assert!(matches!(b, Backend::Tmuxlet(_)));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn is_executable_file_requires_the_exec_bit() {
+        // F-4: a regular-but-non-executable shadow must not count as resolvable.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("tmuxlet-exec-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let shadow = dir.join("tool");
+        std::fs::write(&shadow, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&shadow, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!is_executable_file(&shadow), "0644 file is not executable");
+        std::fs::set_permissions(&shadow, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(is_executable_file(&shadow), "0755 file is executable");
+        assert!(!is_executable_file(&dir.join("missing")), "absent path");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
