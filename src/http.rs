@@ -96,11 +96,35 @@ fn header(name: &str, value: &str) -> Header {
     Header::from_bytes(name.as_bytes(), value.as_bytes()).expect("valid header")
 }
 
+thread_local! {
+    // U-10: the allowed Origin to echo on this request's responses. Set once at
+    // the top of handle() (each worker thread serves one request to completion
+    // before the next), so every response builder can add the header without
+    // threading it through every call site. None = no CORS header.
+    static CORS_ORIGIN: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn set_cors_origin(o: Option<String>) {
+    CORS_ORIGIN.with(|c| *c.borrow_mut() = o);
+}
+
+/// U-10: add `Access-Control-Allow-Origin` when the request's Origin is
+/// allowlisted. Applied to every response so browsers can read them.
+fn apply_cors<R: Read>(resp: Response<R>) -> Response<R> {
+    CORS_ORIGIN.with(|c| match c.borrow().as_deref() {
+        Some(o) => resp
+            .with_header(header("Access-Control-Allow-Origin", o))
+            .with_header(header("Vary", "Origin")),
+        None => resp,
+    })
+}
+
 fn respond_json(req: Request, status: u16, body: String) {
     let resp = Response::from_string(body)
         .with_header(header("Content-Type", "application/json"))
         .with_status_code(status);
-    let _ = req.respond(resp);
+    let _ = req.respond(apply_cors(resp));
 }
 
 fn respond_err(req: Request, status: u16, msg: &str, etype: &str, code: Option<&str>) {
@@ -115,7 +139,7 @@ fn respond_head(req: Request) {
     // U-17: HEAD mirrors GET headers with an empty body.
     let resp =
         Response::empty(StatusCode(200)).with_header(header("Content-Type", "application/json"));
-    let _ = req.respond(resp);
+    let _ = req.respond(apply_cors(resp));
 }
 
 fn respond_405(req: Request, allow: &str) {
@@ -130,7 +154,7 @@ fn respond_405(req: Request, allow: &str) {
         .with_header(header("Content-Type", "application/json"))
         .with_header(header("Allow", allow))
         .with_status_code(405);
-    let _ = req.respond(resp);
+    let _ = req.respond(apply_cors(resp));
 }
 
 fn backend_type_str(b: &crate::config::Backend) -> &'static str {
@@ -146,6 +170,7 @@ pub fn handle(mut req: Request, state: &Arc<State>) {
         Method::Get => "GET",
         Method::Post => "POST",
         Method::Head => "HEAD",
+        Method::Options => "OPTIONS",
         _ => "OTHER",
     };
     let path = req.url().split('?').next().unwrap_or("").to_string();
@@ -154,6 +179,32 @@ pub fn handle(mut req: Request, state: &Arc<State>) {
         .iter()
         .find(|h| h.field.equiv("Authorization"))
         .map(|h| h.value.as_str().to_string());
+    // U-10: resolve the request Origin against the allowlist and record it for
+    // this request's responses (apply_cors reads it via the thread-local).
+    let origin = req
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Origin"))
+        .map(|h| h.value.as_str().to_string());
+    let allowed = origin.filter(|o| state.cfg.server.cors_origins.iter().any(|a| a == o));
+    set_cors_origin(allowed.clone());
+    if method == "OPTIONS" && !state.cfg.server.cors_origins.is_empty() {
+        // CORS preflight: 204, echoing the origin + allowed methods/headers.
+        let mut resp = Response::empty(StatusCode(204));
+        if let Some(o) = &allowed {
+            resp = resp
+                .with_header(header("Access-Control-Allow-Origin", o))
+                .with_header(header("Access-Control-Allow-Methods", "GET, POST, OPTIONS"))
+                .with_header(header(
+                    "Access-Control-Allow-Headers",
+                    "authorization, content-type",
+                ))
+                .with_header(header("Access-Control-Max-Age", "600"))
+                .with_header(header("Vary", "Origin"));
+        }
+        let _ = req.respond(resp);
+        return;
+    }
     let route = classify(method, &path);
     // S-1: gate protected routes; /health stays open for liveness probes.
     if let Some(token) = &state.auth_token
@@ -396,7 +447,7 @@ fn handle_chat(req: Request, raw: &str, state: &Arc<State>) {
             if let Some(rl) = &route_label {
                 resp = resp.with_header(header("x-tmuxlet-route", rl));
             }
-            let _ = req.respond(resp);
+            let _ = req.respond(apply_cors(resp));
         }
         Err(errors) => respond_json(req, 503, build_503_body(&errors, state.redact_errors)),
     }
@@ -480,7 +531,7 @@ fn stream_with_keepalive(
         None,
         None,
     );
-    let _ = req.respond(resp);
+    let _ = req.respond(apply_cors(resp));
 }
 
 /// Walk the chain with P-9 cooldown, P-6 budget, and U-20 concurrency. Returns

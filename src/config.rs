@@ -63,6 +63,10 @@ pub struct Server {
     /// U-3: reject unknown models instead of falling back to default_chain.
     #[serde(default)]
     pub strict_models: bool,
+    /// U-10: browser CORS allowlist. Empty (default) = no CORS headers, current
+    /// behavior. When set, matching Origins are echoed and OPTIONS is answered.
+    #[serde(default)]
+    pub cors_origins: Vec<String>,
 }
 
 fn default_timeout() -> u64 {
@@ -357,6 +361,7 @@ const SERVER_KEYS: &[&str] = &[
     "cooldown",
     "cooldown_secs",
     "strict_models",
+    "cors_origins",
 ];
 const CHAIN_KEYS: &[&str] = &["order"];
 const TMUXLET_KEYS: &[&str] = &[

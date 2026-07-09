@@ -165,3 +165,88 @@ fn prompt_mode_transcript_is_the_default_shaping() {
     assert!(body.contains("System: S"), "body: {body}");
     assert!(body.contains("User: U"), "body: {body}");
 }
+
+fn cors_config(port: u16, origin: &str) -> String {
+    format!(
+        r#"
+[server]
+listen = "127.0.0.1:{port}"
+default_chain = "default"
+env_source = "process"
+cors_origins = ["{origin}"]
+
+[backends.echo]
+type = "cli"
+bin = "/bin/echo"
+
+[chains.default]
+order = ["echo"]
+"#
+    )
+}
+
+#[test]
+fn cors_preflight_204_and_echo_when_origin_allowed() {
+    // U-10: OPTIONS preflight is answered; the allowed Origin is echoed on both
+    // the preflight and the actual GET.
+    let origin = "http://localhost:5173";
+    let server = common::start(&cors_config(common::free_port(), origin));
+
+    let (status, headers, _) = common::send(
+        "OPTIONS",
+        &format!("{}/v1/models", server.base),
+        &[("Origin", origin)],
+    );
+    assert_eq!(status, 204, "preflight should be 204");
+    assert_eq!(
+        headers
+            .get("access-control-allow-origin")
+            .map(String::as_str),
+        Some(origin)
+    );
+    assert!(
+        headers
+            .get("access-control-allow-headers")
+            .is_some_and(|h| h.contains("authorization") && h.contains("content-type")),
+        "preflight allow-headers: {headers:?}"
+    );
+
+    let (gs, gh, _) = common::send(
+        "GET",
+        &format!("{}/v1/models", server.base),
+        &[("Origin", origin)],
+    );
+    assert_eq!(gs, 200);
+    assert_eq!(
+        gh.get("access-control-allow-origin").map(String::as_str),
+        Some(origin),
+        "actual response must echo the origin"
+    );
+}
+
+#[test]
+fn cors_absent_for_unlisted_origin_and_by_default() {
+    // U-10: an unlisted Origin gets no ACAO even on a CORS-enabled server.
+    let server = common::start(&cors_config(common::free_port(), "http://localhost:5173"));
+    let (_s, gh, _) = common::send(
+        "GET",
+        &format!("{}/v1/models", server.base),
+        &[("Origin", "http://evil.test")],
+    );
+    assert!(
+        !gh.contains_key("access-control-allow-origin"),
+        "unlisted origin must not be echoed: {gh:?}"
+    );
+
+    // And the default config (no cors_origins) never emits CORS headers.
+    let plain = common::start(&config(common::free_port()));
+    let (_s2, ph, _) = common::send(
+        "GET",
+        &format!("{}/v1/models", plain.base),
+        &[("Origin", "http://localhost:5173")],
+    );
+    assert!(
+        !ph.contains_key("access-control-allow-origin"),
+        "CORS off by default: {ph:?}"
+    );
+}
