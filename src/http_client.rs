@@ -10,11 +10,14 @@
 //! `rustls::crypto::ring::default_provider().install_default()` MUST have been
 //! called once at startup before `post_json` is used over https.
 
-use rustls::pki_types::ServerName;
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::sync::{Arc, OnceLock};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 fn tls_config() -> Arc<ClientConfig> {
@@ -28,6 +31,53 @@ fn tls_config() -> Arc<ClientConfig> {
         )
     })
     .clone()
+}
+
+/// U-24: TLS config for a backend. `None` uses the cached webpki-only config;
+/// `Some(path)` trusts the webpki roots plus the CA(s) in that PEM file, so a
+/// self-signed LAN upstream can be reached without a blanket insecure switch.
+fn tls_config_for(ca_file: Option<&Path>) -> io::Result<Arc<ClientConfig>> {
+    match ca_file {
+        None => Ok(tls_config()),
+        Some(path) => tls_config_with_ca(path),
+    }
+}
+
+fn tls_config_with_ca(path: &Path) -> io::Result<Arc<ClientConfig>> {
+    // Cache per path so repeated dispatches don't re-read/parse the PEM.
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<ClientConfig>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(cfg) = cache.lock().unwrap().get(path) {
+        return Ok(cfg.clone());
+    }
+    let mut roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let mut added = 0usize;
+    for cert in CertificateDer::pem_file_iter(path)
+        .map_err(|e| io::Error::other(format!("ca_file {}: {e}", path.display())))?
+    {
+        let cert =
+            cert.map_err(|e| io::Error::other(format!("ca_file {}: {e}", path.display())))?;
+        roots
+            .add(cert)
+            .map_err(|e| io::Error::other(format!("ca_file {}: {e}", path.display())))?;
+        added += 1;
+    }
+    if added == 0 {
+        return Err(io::Error::other(format!(
+            "ca_file {} contained no certificates",
+            path.display()
+        )));
+    }
+    let cfg = Arc::new(
+        ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+    cache
+        .lock()
+        .unwrap()
+        .insert(path.to_path_buf(), cfg.clone());
+    Ok(cfg)
 }
 
 fn request_bytes(host: &str, port: u16, path: &str, bearer: Option<&str>, body: &str) -> String {
@@ -179,6 +229,7 @@ pub fn post_json(
     body: &str,
     timeout: Duration,
     max_bytes: usize,
+    ca_file: Option<&Path>,
 ) -> io::Result<(u16, String)> {
     let req = request_bytes(host, port, path, bearer, body);
     let mut raw = Vec::new();
@@ -186,7 +237,8 @@ pub fn post_json(
     if scheme == "https" {
         let name = ServerName::try_from(host.to_string())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        let conn = ClientConnection::new(tls_config(), name).map_err(io::Error::other)?;
+        let conn =
+            ClientConnection::new(tls_config_for(ca_file)?, name).map_err(io::Error::other)?;
         let mut tls = StreamOwned::new(conn, tcp);
         tls.write_all(req.as_bytes())?;
         tls.flush()?;
@@ -260,5 +312,31 @@ mod tests {
         let mut buf = Vec::new();
         let err = read_body(&mut cursor, &mut buf, 200).unwrap_err();
         assert!(err.to_string().contains("max_response_bytes"));
+    }
+
+    #[test]
+    fn tls_config_for_none_uses_the_shared_config() {
+        // U-24: no ca_file -> the cached webpki-only config, no error.
+        assert!(tls_config_for(None).is_ok());
+    }
+
+    #[test]
+    fn tls_config_with_ca_rejects_missing_and_certless_files() {
+        // U-24: a nonexistent ca_file surfaces as an error (chain-visible).
+        let missing = std::path::Path::new("/nonexistent/tmuxlet-ca.pem");
+        assert!(tls_config_for(Some(missing)).is_err());
+
+        // A readable file with no PEM certificate is rejected, not silently
+        // treated as "trust nothing extra".
+        let dir = std::env::temp_dir().join(format!("tmuxlet-ca-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("not-a-cert.pem");
+        std::fs::write(&f, b"this is not a certificate").unwrap();
+        let err = tls_config_for(Some(&f)).unwrap_err();
+        assert!(
+            err.to_string().contains("no certificates"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

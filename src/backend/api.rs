@@ -107,6 +107,7 @@ pub fn dispatch(
         &body,
         timeout,
         b.max_response_bytes as usize,
+        b.ca_file.as_deref(),
     )
     .map_err(|e| {
         let m = e.to_string();

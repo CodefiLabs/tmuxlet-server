@@ -157,6 +157,10 @@ pub enum Backend {
         /// U-20: max simultaneous dispatches to this backend.
         #[serde(default)]
         max_concurrent: Option<usize>,
+        /// U-24: custom CA PEM path (tilde-expanded) trusted for this backend's
+        /// TLS in addition to the webpki roots.
+        #[serde(default)]
+        ca_file: Option<String>,
     },
     Cli {
         bin: String,
@@ -337,6 +341,16 @@ pub fn lint(cfg: &Config, text: &str) -> Vec<String> {
                 "backends.{bname}.prompt_mode '{m}' is neither 'transcript' nor 'last_user' — using 'transcript'"
             ));
         }
+        // U-24: a configured ca_file must exist, or TLS to that upstream fails.
+        if let Backend::Api {
+            ca_file: Some(p), ..
+        } = b
+            && !tilde_path(p).exists()
+        {
+            out.push(format!(
+                "backends.{bname}.ca_file '{p}' does not exist — create it or drop the key to use the system CAs"
+            ));
+        }
     }
 
     out
@@ -383,6 +397,7 @@ const API_KEYS: &[&str] = &[
     "timeout_secs",
     "allow_empty",
     "max_concurrent",
+    "ca_file",
 ];
 const CLI_KEYS: &[&str] = &[
     "type",
@@ -529,6 +544,9 @@ fn expand_paths(cfg: &mut Config) {
                     *c = expand_tilde(c);
                 }
             }
+            Backend::Api {
+                ca_file: Some(c), ..
+            } => *c = expand_tilde(c),
             _ => {}
         }
     }
@@ -656,6 +674,30 @@ order = ["agy", "ollama-kimi", "claude-thinking"]
         assert!(
             warnings.iter().any(|w| w.contains("backends.agy.ptysize")),
             "got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn lint_flags_missing_ca_file() {
+        // U-24: a ca_file that doesn't exist is a validate-error / serve-warning,
+        // and the key itself is recognized (no unknown-key noise).
+        let bad = SAMPLE.replace(
+            "timeout_secs = 120",
+            "timeout_secs = 120\nca_file = \"/nonexistent/tmuxlet-ca.pem\"",
+        );
+        let cfg = parse(&bad).unwrap();
+        let warnings = lint(&cfg, &bad);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("backends.ollama-kimi.ca_file")),
+            "missing ca_file not flagged: {warnings:?}"
+        );
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.contains("unknown") && w.contains("ca_file")),
+            "ca_file should be a known key: {warnings:?}"
         );
     }
 

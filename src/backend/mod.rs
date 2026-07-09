@@ -110,6 +110,8 @@ pub struct ApiBackend {
     pub max_response_bytes: u64,
     /// U-20: max simultaneous dispatches (None = unlimited).
     pub max_concurrent: Option<usize>,
+    /// U-24: custom CA PEM (tilde-expanded) trusted in addition to webpki roots.
+    pub ca_file: Option<PathBuf>,
 }
 
 pub struct CliBackend {
@@ -207,6 +209,7 @@ impl Backend {
                 timeout_secs,
                 allow_empty,
                 max_concurrent,
+                ca_file,
             } => Backend::Api(ApiBackend {
                 name: name.into(),
                 base_url: base_url.clone(),
@@ -217,6 +220,7 @@ impl Backend {
                 allow_empty: *allow_empty,
                 max_response_bytes: defaults.max_response_bytes,
                 max_concurrent: *max_concurrent,
+                ca_file: ca_file.clone().map(PathBuf::from),
             }),
             config::Backend::Cli {
                 bin,
