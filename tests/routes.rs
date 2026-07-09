@@ -82,3 +82,31 @@ fn reserved_api_and_root_are_501() {
     let (root_status, _) = common::get(&format!("{}/", server.base));
     assert_eq!(root_status, 501, "/ should be reserved");
 }
+
+#[test]
+fn head_on_known_get_route_is_200_with_empty_body() {
+    // U-17: HEAD mirrors GET but carries no body.
+    let server = common::start(&config(common::free_port()));
+    let (status, _allow, body) = common::request("HEAD", &format!("{}/v1/models", server.base));
+    assert_eq!(status, 200, "HEAD /v1/models should be 200");
+    assert!(body.is_empty(), "HEAD must not return a body: {body:?}");
+}
+
+#[test]
+fn wrong_method_on_known_path_is_405_with_allow_header() {
+    // U-17: a known path reached with the wrong method → 405 naming the fix.
+    let server = common::start(&config(common::free_port()));
+    let (status, allow, body) = common::request("DELETE", &format!("{}/v1/models", server.base));
+    assert_eq!(status, 405, "DELETE /v1/models should be 405: {body}");
+    assert_eq!(
+        allow.as_deref(),
+        Some("GET, HEAD"),
+        "Allow header missing/wrong"
+    );
+    assert!(body.contains("method_not_allowed"), "body: {body}");
+
+    let (chat_status, chat_allow, _) =
+        common::request("GET", &format!("{}/v1/chat/completions", server.base));
+    assert_eq!(chat_status, 405, "GET /v1/chat/completions should be 405");
+    assert_eq!(chat_allow.as_deref(), Some("POST"), "Allow should be POST");
+}

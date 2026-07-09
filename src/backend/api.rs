@@ -11,9 +11,23 @@ pub fn split_url(base_url: &str) -> (String, String, u16, String) {
         None => (rest, ""),
     };
     let default_port = if scheme == "https" { 443 } else { 80 };
-    let (host, port) = match authority.split_once(':') {
-        Some((h, p)) => (h.to_string(), p.parse().unwrap_or(default_port)),
-        None => (authority.to_string(), default_port),
+    // U-19: a bracketed IPv6 literal, e.g. `[::1]:11434`.
+    let (host, port) = if let Some(after_bracket) = authority.strip_prefix('[') {
+        match after_bracket.split_once(']') {
+            Some((h, tail)) => {
+                let port = tail
+                    .strip_prefix(':')
+                    .and_then(|p| p.parse().ok())
+                    .unwrap_or(default_port);
+                (h.to_string(), port)
+            }
+            None => (after_bracket.to_string(), default_port),
+        }
+    } else {
+        match authority.split_once(':') {
+            Some((h, p)) => (h.to_string(), p.parse().unwrap_or(default_port)),
+            None => (authority.to_string(), default_port),
+        }
     };
     (scheme.to_string(), host, port, path.to_string())
 }
@@ -147,6 +161,15 @@ mod tests {
                 443,
                 "/api/v1".into()
             )
+        );
+        // U-19: bracketed IPv6 literals.
+        assert_eq!(
+            split_url("http://[::1]:11434/v1"),
+            ("http".into(), "::1".into(), 11434, "/v1".into())
+        );
+        assert_eq!(
+            split_url("http://[fe80::1]/v1"),
+            ("http".into(), "fe80::1".into(), 80, "/v1".into())
         );
     }
 

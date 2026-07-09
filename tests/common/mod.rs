@@ -86,6 +86,22 @@ pub fn post_collect(url: &str, body: &str) -> (u16, String, String) {
     }
 }
 
+/// Send an arbitrary method (HEAD, DELETE, ...); returns (status, Allow header, body).
+pub fn request(method: &str, url: &str) -> (u16, Option<String>, String) {
+    let grab = |resp: ureq::Response| {
+        let allow = resp.header("Allow").map(|s| s.to_string());
+        (resp.status(), allow, resp.into_string().unwrap_or_default())
+    };
+    match agent().request(method, url).call() {
+        Ok(resp) => grab(resp),
+        Err(ureq::Error::Status(_code, resp)) => {
+            let allow = resp.header("Allow").map(|s| s.to_string());
+            (resp.status(), allow, resp.into_string().unwrap_or_default())
+        }
+        Err(e) => panic!("{method} {url} failed (transport error): {e}"),
+    }
+}
+
 /// Write `config_toml` to a temp file, spawn the binary against it, and poll
 /// `/health` until it answers 200 (or panic after ~5s). `config_toml` MUST
 /// contain a `listen = "127.0.0.1:PORT"` line. Test configs should set

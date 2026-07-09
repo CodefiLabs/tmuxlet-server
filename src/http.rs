@@ -17,14 +17,23 @@ pub enum Route {
     Chat,
     Reserved,
     NotFound,
+    /// U-17: a known path reached with the wrong method. Carries the `Allow` value.
+    MethodNotAllowed(&'static str),
 }
 
 pub fn classify(method: &str, path: &str) -> Route {
-    match (method, path) {
+    // U-17: HEAD routes like GET; the handler emits headers with an empty body.
+    let m = if method == "HEAD" { "GET" } else { method };
+    match (m, path) {
         ("GET", "/health") => Route::Health,
         ("GET", "/v1/models") => Route::Models,
         ("GET", "/v1/backends") => Route::Backends,
         ("POST", "/v1/chat/completions") => Route::Chat,
+        // U-17: known path, wrong method → 405 with an Allow header.
+        (_, "/health") | (_, "/v1/models") | (_, "/v1/backends") => {
+            Route::MethodNotAllowed("GET, HEAD")
+        }
+        (_, "/v1/chat/completions") => Route::MethodNotAllowed("POST"),
         _ if path == "/" || path.starts_with("/ui") || path.starts_with("/api") => Route::Reserved,
         _ => Route::NotFound,
     }
@@ -102,6 +111,28 @@ fn respond_err(req: Request, status: u16, msg: &str, etype: &str, code: Option<&
     );
 }
 
+fn respond_head(req: Request) {
+    // U-17: HEAD mirrors GET headers with an empty body.
+    let resp =
+        Response::empty(StatusCode(200)).with_header(header("Content-Type", "application/json"));
+    let _ = req.respond(resp);
+}
+
+fn respond_405(req: Request, allow: &str) {
+    // U-17: wrong method on a known path — the Allow header names the fix.
+    let body = openai::ErrorEnvelope::new(
+        format!("method not allowed on this path; use: {allow}"),
+        "invalid_request_error",
+        Some("method_not_allowed"),
+    )
+    .to_json();
+    let resp = Response::from_string(body)
+        .with_header(header("Content-Type", "application/json"))
+        .with_header(header("Allow", allow))
+        .with_status_code(405);
+    let _ = req.respond(resp);
+}
+
 fn backend_type_str(b: &crate::config::Backend) -> &'static str {
     match b {
         crate::config::Backend::Tmuxlet { .. } => "tmuxlet",
@@ -140,7 +171,12 @@ pub fn handle(mut req: Request, state: &Arc<State>) {
             Some("unauthorized"),
         );
     }
+    // U-17: HEAD carries no body — respond with headers only for GET-family routes.
+    if method == "HEAD" && matches!(route, Route::Health | Route::Models | Route::Backends) {
+        return respond_head(req);
+    }
     match route {
+        Route::MethodNotAllowed(allow) => respond_405(req, allow),
         Route::Health => {
             let body = format!(
                 "{{\"status\":\"ok\",\"version\":\"{}\",\"backends\":{},\"chains\":{}}}",
@@ -721,6 +757,18 @@ mod tests {
         assert!(matches!(classify("GET", "/ui/index.html"), Route::Reserved));
         assert!(matches!(classify("GET", "/"), Route::Reserved));
         assert!(matches!(classify("GET", "/nope"), Route::NotFound));
+        // U-17: HEAD mirrors GET routing.
+        assert!(matches!(classify("HEAD", "/health"), Route::Health));
+        assert!(matches!(classify("HEAD", "/v1/models"), Route::Models));
+        // U-17: known path, wrong method → 405 with the right Allow value.
+        assert!(matches!(
+            classify("DELETE", "/v1/models"),
+            Route::MethodNotAllowed("GET, HEAD")
+        ));
+        assert!(matches!(
+            classify("GET", "/v1/chat/completions"),
+            Route::MethodNotAllowed("POST")
+        ));
     }
 
     #[test]
