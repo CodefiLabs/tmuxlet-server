@@ -314,3 +314,38 @@ fn route_header_names_the_winning_backend() {
         "third segment must name the winning backend: '{route}'"
     );
 }
+
+#[test]
+fn strict_models_off_falls_back_to_default_chain() {
+    // U-3: default (strict_models unset) — an unknown model runs default_chain.
+    let server = common::start(&config(common::free_port()));
+    let (status, body) = common::post_json(
+        &format!("{}/v1/chat/completions", server.base),
+        r#"{"model":"nonexistent-model","messages":[{"role":"user","content":"hi"}]}"#,
+    );
+    assert_eq!(status, 200, "unknown model should fall back, got: {body}");
+    assert!(body.contains("chat.completion"), "body: {body}");
+}
+
+#[test]
+fn strict_models_on_rejects_unknown_model_and_names_the_fix() {
+    // U-3 + invariant 3: strict_models = true -> 404 that names its remedy.
+    let cfg = config(common::free_port()).replace(
+        "env_source = \"process\"",
+        "env_source = \"process\"\nstrict_models = true",
+    );
+    let server = common::start(&cfg);
+    let (status, body) = common::post_json(
+        &format!("{}/v1/chat/completions", server.base),
+        r#"{"model":"nonexistent-model","messages":[{"role":"user","content":"hi"}]}"#,
+    );
+    assert_eq!(
+        status, 404,
+        "strict_models must reject unknown model: {body}"
+    );
+    assert!(body.contains("model_not_found"), "body: {body}");
+    assert!(
+        body.contains("/v1/models") && body.contains("strict_models = false"),
+        "404 must name both remedies: {body}"
+    );
+}

@@ -462,7 +462,9 @@ fn handle_chat(req: Request, raw: &str, state: &Arc<State>) {
                 return respond_err(
                     req,
                     404,
-                    &format!("unknown model '{model}'"),
+                    &format!(
+                        "unknown model '{model}' — list valid ids at GET /v1/models, or set strict_models = false to fall back to default_chain"
+                    ),
                     "invalid_request_error",
                     Some("model_not_found"),
                 );
