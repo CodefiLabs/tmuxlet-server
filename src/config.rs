@@ -882,17 +882,26 @@ order = ["agy", "ollama-kimi", "claude-thinking"]
 
     #[test]
     fn example_config_parses_validates_and_lints_clean() {
-        // D1 / invariant 4: the shipped example must always parse, validate, and
-        // lint with zero warnings — this catches a typo in the active config or a
-        // reference key that drifted out of the *_KEYS arrays.
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/server.toml");
-        let text = std::fs::read_to_string(&path).expect("examples/server.toml must exist");
+        assert_shipped_example_clean("examples/server.toml");
+    }
+
+    #[test]
+    fn router_framework_example_parses_validates_and_lints_clean() {
+        assert_shipped_example_clean("examples/server-router-framework.toml");
+    }
+
+    // D1 / invariant 4: every shipped example must always parse, validate, and
+    // lint with zero warnings — catches a typo in an active config or a
+    // reference key that drifted out of the *_KEYS arrays.
+    fn assert_shipped_example_clean(rel: &str) {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|_| panic!("{rel} must exist"));
         let cfg = parse(&text).expect("example config must parse");
         validate(&cfg).expect("example config must validate");
         let warnings = lint(&cfg, &text);
         assert!(
             warnings.is_empty(),
-            "example config must lint clean, got: {warnings:?}"
+            "{rel} must lint clean, got: {warnings:?}"
         );
     }
 }

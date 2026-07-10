@@ -1,0 +1,188 @@
+# ==============================================================================
+# tmuxlet-server example — a task-router framework:  think · plan · do · review · improve
+# ==============================================================================
+# A companion to examples/server.toml (which is the minimal happy path + a full
+# reference block for every optional key). This example instead demonstrates ONE
+# opinionated pattern: five coarse task categories, each an auto-router whose
+# LEAVES you grow over time without touching the binary.
+#
+# The backends below are a sample macOS setup (local agent CLIs + ollama-cloud +
+# OpenRouter) — swap in your own bins/models. Copy to ~/.tmuxlet/server.toml and
+# run `tmuxlet-server --validate && tmuxlet-server --check-backends` first.
+#
+# ── ROUTING MODEL (what a request `model` string resolves to) ────────────────
+#   model = "do"          -> a ROUTER: a cheap classifier labels the task and
+#                            picks one of the router's leaves.
+#   model = "do-code"     -> a CHAIN: an ordered fallback list of backends.
+#   model = "claude-max"  -> a single BACKEND.
+#   (no match             -> server.default_chain, or 404 if strict_models = true)
+#
+# ── THE FIVE COARSE CATEGORIES are routers: think, plan, do, review, improve. ─
+# Their LEAVES are 100% config — nothing is hardcoded in the binary. Each ships
+# with one neutral `general` leaf so it works out of the box; add your own.
+#
+# ── HOW TO ADD A LEAF (e.g. give `do` a dedicated `code` leaf) ────────────────
+#   1. Add a route under the router:   [routers.do.routes]  code = "do-code"
+#   2. Define its chain:               [chains.do-code]  order = ["agy", "codex"]
+#   3. Re-validate + restart:          tmuxlet-server --validate && <restart>
+#   The classifier reads its class list LIVE from the routes map, so it starts
+#   choosing `code` immediately — no code change, no rebuild.
+#
+# Call a leaf directly (model = "do-code") to skip the classifier; call the
+# coarse name (model = "do") to let the classifier pick. A router with only
+# `general` just runs the classifier as a no-op until you add a 2nd leaf.
+#
+# NOTE: config changes require a server RESTART (no hot-reload). Always
+# `--validate` before restarting.
+# ==============================================================================
+
+[server]
+listen = "127.0.0.1:3456"            # loopback only; no auth needed for local use
+default_chain = "do-general"         # where unmatched models land
+request_timeout_secs = 1800          # per-leg default; agent turns run minutes
+env_source = "shell"                 # run `$SHELL -ilc env` so ~/.zshrc PATH (agy, claude, codex) is visible
+log_level = "info"                   # error | warn | info | debug
+# cooldown is ON by default (a rate-limited/erroring backend is briefly benched,
+# and the chain advances). auth is OFF by default (local use). See
+# examples/server.toml for the full reference block of optional keys.
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BACKENDS  —  the model pool every leaf draws from (adapt to your machine)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Local agent CLIs (flat-rate via your subscriptions; agentic — run tools) ──
+
+[backends.claude-max]                # deep reasoning + agentic
+type = "tmuxlet"
+target = "claude"
+target_args = ["--effort", "max"]
+cwd = "~"
+
+[backends.codex]                     # agentic coding / running tests
+type = "tmuxlet"
+target = "codex"
+cwd = "~"
+
+[backends.agy]                       # a coding-agent CLI that needs a PTY
+type = "cli"
+bin = "agy"                          # resolved on PATH; or give an absolute path
+args = ["-p", "{prompt}"]            # {prompt} lands in argv (agy's -p takes it as a value)
+pty = true
+
+# ── Ollama cloud models (OpenAI-compatible at localhost; metered but cheap) ───
+
+[backends.deepseek-pro]              # strong reasoning + coding
+type = "api"
+base_url = "http://127.0.0.1:11434/v1"
+model = "deepseek-v4-pro:cloud"
+timeout_secs = 300
+
+[backends.kimi-code]                 # coding-specialized
+type = "api"
+base_url = "http://127.0.0.1:11434/v1"
+model = "kimi-k2.7-code:cloud"
+timeout_secs = 300
+
+[backends.glm]                       # broadly capable generalist
+type = "api"
+base_url = "http://127.0.0.1:11434/v1"
+model = "glm-5.2:cloud"
+timeout_secs = 180
+
+[backends.gemini-flash]              # fast + cheap: the classifier and `improve` workhorse
+type = "api"
+base_url = "http://127.0.0.1:11434/v1"
+model = "gemini-3-flash-preview:cloud"
+timeout_secs = 60
+
+[backends.gpt-oss]                   # cheap fallback
+type = "api"
+base_url = "http://127.0.0.1:11434/v1"
+model = "gpt-oss:20b-cloud"
+timeout_secs = 120
+
+[backends.deepseek-flash]            # cheap fast fallback
+type = "api"
+base_url = "http://127.0.0.1:11434/v1"
+model = "deepseek-v4-flash:cloud"
+timeout_secs = 120
+
+# ── Cloud API (metered credits) ───────────────────────────────────────────────
+
+[backends.or-sonnet]                 # reliable cloud fallback / strong prose
+type = "api"
+base_url = "https://openrouter.ai/api/v1"
+model = "anthropic/claude-sonnet-4.6"
+api_key_env = "OPENROUTER_API_KEY"   # env var NAME, not the key
+timeout_secs = 180
+
+# ══════════════════════════════════════════════════════════════════════════════
+# COARSE CATEGORIES  —  five routers, each with a `general` leaf you can extend
+# ══════════════════════════════════════════════════════════════════════════════
+# Every router uses the cheap `gemini-flash` classifier. To guide it once you add
+# leaves, uncomment `classifier_prompt` and describe them ({classes}/{input} are
+# filled in automatically), e.g.:
+#   classifier_prompt = "Pick ONE of: {classes}. code=writing/editing code,
+#   write=prose/docs. Task:\n{input}"
+
+# ── think — diverge, explore, research ───────────────────────────────────────
+[routers.think]
+classifier = "gemini-flash"
+fallback_class = "general"
+[routers.think.routes]
+general = "think-general"
+# research   = "think-research"      # ← example leaf (add a [chains.think-research])
+# brainstorm = "think-brainstorm"
+
+[chains.think-general]
+order = ["claude-max", "deepseek-pro", "or-sonnet"]
+
+# ── plan — design, spec, break down work ─────────────────────────────────────
+[routers.plan]
+classifier = "gemini-flash"
+fallback_class = "general"
+[routers.plan.routes]
+general = "plan-general"
+# prd        = "plan-prd"
+# spec       = "plan-spec"
+# user-story = "plan-user-story"
+
+[chains.plan-general]
+order = ["deepseek-pro", "claude-max", "glm"]
+
+# ── do — produce: code, prose, whatever gets made ────────────────────────────
+[routers.do]
+classifier = "gemini-flash"
+fallback_class = "general"
+[routers.do.routes]
+general = "do-general"
+# code  = "do-code"                  # e.g. order = ["agy", "codex", "kimi-code"]
+# write = "do-write"                 # e.g. order = ["or-sonnet", "glm", "gemini-flash"]
+
+[chains.do-general]
+order = ["claude-max", "codex", "or-sonnet"]
+
+# ── review — critique + verify (cross-model: use models ≠ the `do` leaves) ────
+[routers.review]
+classifier = "gemini-flash"
+fallback_class = "general"
+[routers.review.routes]
+general = "review-general"
+# code   = "review-code"             # e.g. order = ["claude-max", "deepseek-pro"]  (≠ do-code)
+# write  = "review-write"            # e.g. order = ["deepseek-pro", "glm"]         (≠ do-write)
+# verify = "review-verify"           # e.g. order = ["codex", "agy"]  (agentic — runs the tests)
+
+[chains.review-general]
+order = ["deepseek-pro", "claude-max", "glm"]
+
+# ── improve — learn, summarize, memory, retros ───────────────────────────────
+[routers.improve]
+classifier = "gemini-flash"
+fallback_class = "general"
+[routers.improve.routes]
+general = "improve-general"
+# memory = "improve-memory"
+# retro  = "improve-retro"
+
+[chains.improve-general]
+order = ["gemini-flash", "gpt-oss", "deepseek-flash"]
