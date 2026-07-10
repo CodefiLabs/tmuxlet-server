@@ -323,6 +323,18 @@ pub fn lint(cfg: &Config, text: &str) -> Vec<String> {
         ));
     }
 
+    // U-8: an unknown log_level is silently treated as info (and debug — the
+    // useful one — is easy to miss). Flag it, matching the env_source arm.
+    if !matches!(
+        cfg.server.log_level.as_str(),
+        "error" | "warn" | "info" | "debug"
+    ) {
+        out.push(format!(
+            "server.log_level '{}' is not one of error|warn|info|debug — it will be treated as 'info'",
+            cfg.server.log_level
+        ));
+    }
+
     // U-12: pty_size must be [cols, rows].
     for (bname, b) in &cfg.backends {
         if let Backend::Cli {
@@ -357,6 +369,36 @@ pub fn lint(cfg: &Config, text: &str) -> Vec<String> {
         {
             out.push(format!(
                 "backends.{bname}.ca_file '{p}' does not exist — create it or drop the key to use the system CAs"
+            ));
+        }
+    }
+
+    // U-10: cors_origins matching is exact string equality (http.rs handle), so an
+    // entry that can never equal a browser's Origin header is silently dead.
+    for o in &cfg.server.cors_origins {
+        if o == "*" {
+            out.push(
+                "server.cors_origins entry \"*\" is not a wildcard — matching is exact; list each origin explicitly, e.g. http://localhost:5173"
+                    .into(),
+            );
+        } else if o == "null" {
+            out.push(
+                "server.cors_origins entry \"null\" matches the spoofable \"Origin: null\" (sandboxed iframes, file://); remove it unless you truly mean to allow those"
+                    .into(),
+            );
+        } else if !o.starts_with("http://") && !o.starts_with("https://") {
+            out.push(format!(
+                "server.cors_origins '{o}' has no scheme — a browser Origin is scheme://host[:port], e.g. http://{o}"
+            ));
+        } else if o.ends_with('/') {
+            out.push(format!(
+                "server.cors_origins '{o}' has a trailing slash — a browser Origin has none, e.g. {}",
+                o.trim_end_matches('/')
+            ));
+        } else if o.chars().any(|c| c.is_ascii_uppercase()) {
+            out.push(format!(
+                "server.cors_origins '{o}' has uppercase characters — browsers send the Origin lowercased, so it can never match; use '{}'",
+                o.to_ascii_lowercase()
             ));
         }
     }
@@ -758,5 +800,40 @@ order = ["agy", "ollama-kimi", "claude-thinking"]
                 _ => panic!(),
             }
         }
+    }
+
+    #[test]
+    fn lint_flags_unknown_log_level() {
+        // B8: 'trace' is not a real level (logger has error|warn|info|debug).
+        let bad = SAMPLE.replace("log_level = \"info\"", "log_level = \"trace\"");
+        let cfg = parse(&bad).unwrap();
+        let w = lint(&cfg, &bad);
+        assert!(
+            w.iter()
+                .any(|x| x.contains("log_level") && x.contains("error|warn|info|debug")),
+            "trace should be flagged: {w:?}"
+        );
+    }
+
+    #[test]
+    fn lint_flags_bad_cors_origins() {
+        // B7: each shape that can never match exact-equality is flagged.
+        let base = SAMPLE.replace(
+            "log_level = \"info\"",
+            "log_level = \"info\"\ncors_origins = [\"*\", \"http://localhost:5173/\", \"localhost:3000\", \"null\", \"http://LocalHost:5173\"]",
+        );
+        let cfg = parse(&base).unwrap();
+        let w = lint(&cfg, &base);
+        assert!(
+            w.iter().any(|x| x.contains("not a wildcard")),
+            "star: {w:?}"
+        );
+        assert!(
+            w.iter().any(|x| x.contains("trailing slash")),
+            "slash: {w:?}"
+        );
+        assert!(w.iter().any(|x| x.contains("no scheme")), "scheme: {w:?}");
+        assert!(w.iter().any(|x| x.contains("null")), "null: {w:?}");
+        assert!(w.iter().any(|x| x.contains("uppercase")), "case: {w:?}");
     }
 }

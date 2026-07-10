@@ -9,7 +9,7 @@ request_timeout_secs = 1800          # server-wide default; tmuxlet/cli coding t
 # interactive zsh) so PATH entries exported in ~/.zshrc (e.g. agy) are visible
 # to spawned backends. Use "process" to skip that and inherit the current env.
 env_source = "shell"
-log_level = "info"                   # trace | info | warn | error
+log_level = "info"                   # error | warn | info | debug
 
 # ── Backends ────────────────────────────────────────────────────────────────
 
