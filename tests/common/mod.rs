@@ -111,6 +111,34 @@ pub fn post_headers(
         Err(e) => panic!("POST {url} failed (transport error): {e}"),
     }
 }
+
+/// Send `method` with extra request headers AND a JSON body; returns (status,
+/// lowercased response-header map, body). For auth-gated POSTs.
+pub fn send_body(
+    method: &str,
+    url: &str,
+    req_headers: &[(&str, &str)],
+    body: &str,
+) -> (u16, std::collections::HashMap<String, String>, String) {
+    let mut r = agent().request(method, url);
+    for (k, v) in req_headers {
+        r = r.set(k, v);
+    }
+    let grab = |resp: ureq::Response| {
+        let mut hs = std::collections::HashMap::new();
+        for name in resp.headers_names() {
+            if let Some(v) = resp.header(&name) {
+                hs.insert(name.to_ascii_lowercase(), v.to_string());
+            }
+        }
+        (resp.status(), hs, resp.into_string().unwrap_or_default())
+    };
+    match r.send_string(body) {
+        Ok(resp) => grab(resp),
+        Err(ureq::Error::Status(_code, resp)) => grab(resp),
+        Err(e) => panic!("{method} {url} failed (transport error): {e}"),
+    }
+}
 /// Send an arbitrary method (HEAD, DELETE, ...); returns (status, Allow header, body).
 pub fn request(method: &str, url: &str) -> (u16, Option<String>, String) {
     let grab = |resp: ureq::Response| {
