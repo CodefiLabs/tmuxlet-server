@@ -30,6 +30,12 @@ impl Env {
         Env(Arc::new(map))
     }
 
+    /// Test-only constructor from an explicit map (e.g. a crafted PATH).
+    #[cfg(test)]
+    pub(crate) fn from_map(map: HashMap<String, String>) -> Env {
+        Env(Arc::new(map))
+    }
+
     pub fn get(&self, k: &str) -> Option<&str> {
         self.0.get(k).map(String::as_str)
     }

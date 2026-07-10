@@ -836,4 +836,35 @@ order = ["agy", "ollama-kimi", "claude-thinking"]
         assert!(w.iter().any(|x| x.contains("null")), "null: {w:?}");
         assert!(w.iter().any(|x| x.contains("uppercase")), "case: {w:?}");
     }
+
+    #[test]
+    fn lint_flags_invalid_prompt_mode_value() {
+        // U-14: prompt_mode must be transcript | last_user; an unknown value is a
+        // validate-error / serve-warning naming the fallback.
+        let bad = SAMPLE.replace("pty = true", "pty = true\nprompt_mode = \"verbatim\"");
+        let cfg = parse(&bad).unwrap();
+        let w = lint(&cfg, &bad);
+        assert!(
+            w.iter()
+                .any(|x| x.contains("prompt_mode") && x.contains("transcript")),
+            "invalid prompt_mode not flagged: {w:?}"
+        );
+    }
+
+    #[test]
+    fn lint_flags_prompt_mode_on_an_api_backend_as_unknown() {
+        // U-14: prompt_mode is meaningless for api backends (they pass raw JSON),
+        // so it is not an API key and must surface as an unknown key.
+        let bad = SAMPLE.replace(
+            "model = \"kimi-k2.6:cloud\"",
+            "model = \"kimi-k2.6:cloud\"\nprompt_mode = \"last_user\"",
+        );
+        let cfg = parse(&bad).unwrap();
+        let w = lint(&cfg, &bad);
+        assert!(
+            w.iter()
+                .any(|x| x.contains("backends.ollama-kimi.prompt_mode")),
+            "prompt_mode on an api backend should be an unknown key: {w:?}"
+        );
+    }
 }

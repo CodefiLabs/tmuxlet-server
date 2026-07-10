@@ -418,4 +418,94 @@ order = ["t"]
         assert!(!is_executable_file(&dir.join("missing")), "absent path");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn invalid_prompt_mode_falls_back_to_transcript() {
+        // U-14: an unrecognized prompt_mode value is accepted at serve time and
+        // defaults to Transcript (lint warns; serve never bricks over it).
+        let cfg = crate::config::parse(
+            r#"
+[server]
+listen = "127.0.0.1:3456"
+default_chain = "d"
+
+[backends.c]
+type = "cli"
+bin = "/bin/echo"
+prompt_mode = "verbatim"
+
+[chains.d]
+order = ["c"]
+"#,
+        )
+        .unwrap();
+        let env = crate::env::Env::capture("process", "", 5);
+        let defaults = ServerDefaults {
+            max_response_bytes: 1024,
+            env_pass: None,
+            tmuxlet_stdin: false,
+        };
+        let b = Backend::from_config("c", &cfg.backends["c"], &env, &defaults);
+        assert_eq!(b.prompt_mode(), crate::openai::PromptMode::Transcript);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolve_program_keeps_scanning_past_a_nonexecutable_shadow() {
+        // F-4: PATH = dirA(0644 shadow) : dirB(0755 real) must resolve to dirB,
+        // matching execvp semantics (a non-executable shadow is skipped, not a
+        // hard stop).
+        use std::collections::HashMap;
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("tmuxlet-path-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir_a = root.join("a");
+        let dir_b = root.join("b");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+        std::fs::write(dir_a.join("tool"), b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(dir_a.join("tool"), std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        std::fs::write(dir_b.join("tool"), b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(dir_b.join("tool"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let mut m = HashMap::new();
+        m.insert(
+            "PATH".to_string(),
+            format!("{}:{}", dir_a.display(), dir_b.display()),
+        );
+        let env = crate::env::Env::from_map(m);
+        assert_eq!(
+            resolve_program("tool", &env),
+            dir_b.join("tool"),
+            "must skip the shadow in dirA and resolve to dirB"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn is_executable_file_follows_symlinks() {
+        // A symlink (Homebrew-style PATHs) must resolve to its target: metadata()
+        // follows the link, unlike symlink_metadata().
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let dir = std::env::temp_dir().join(format!("tmuxlet-symlink-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("real");
+        std::fs::write(&target, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let link = dir.join("link");
+        symlink(&target, &link).unwrap();
+        assert!(
+            is_executable_file(&link),
+            "a symlink to a 0755 target must resolve as executable"
+        );
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            !is_executable_file(&link),
+            "a symlink to a 0644 target is not executable"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
