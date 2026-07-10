@@ -867,4 +867,20 @@ order = ["agy", "ollama-kimi", "claude-thinking"]
             "prompt_mode on an api backend should be an unknown key: {w:?}"
         );
     }
+
+    #[test]
+    fn example_config_parses_validates_and_lints_clean() {
+        // D1 / invariant 4: the shipped example must always parse, validate, and
+        // lint with zero warnings — this catches a typo in the active config or a
+        // reference key that drifted out of the *_KEYS arrays.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/server.toml");
+        let text = std::fs::read_to_string(&path).expect("examples/server.toml must exist");
+        let cfg = parse(&text).expect("example config must parse");
+        validate(&cfg).expect("example config must validate");
+        let warnings = lint(&cfg, &text);
+        assert!(
+            warnings.is_empty(),
+            "example config must lint clean, got: {warnings:?}"
+        );
+    }
 }

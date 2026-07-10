@@ -52,3 +52,69 @@ order = ["agy", "ollama-kimi", "claude-thinking"]
 
 [chains.thinking]
 order = ["claude-thinking", "agy"]
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Reference — every optional key with its default. Everything below is COMMENTED
+# OUT: the happy path above stays minimal (UX invariant 4). Uncomment and adjust.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── [server] optional keys ──────────────────────────────────────────────────
+# request_timeout_secs = 1800       # per-leg dispatch timeout (tmuxlet/cli run minutes)
+# env_source = "shell"              # "shell" (run $SHELL -ilc env) | "process"
+# log_level = "info"                # error | warn | info | debug
+# env_capture_timeout_secs = 15     # S-9 watchdog bounding the shell env capture
+# auth = false                      # S-1: require a bearer token on /v1/* (not /health)
+# auth_token_env = "TMUXLET_TOKEN"  # read the token from this env var (wins over the file);
+#                                   #   when auth=true and this is unset, a token is
+#                                   #   generated once into ~/.tmuxlet/token (0600)
+# env_pass = ["OPENAI_*", "AWS_*"]  # S-3: server-wide env allowlist (globs) for backends
+# max_response_bytes = 67108864     # S-5: cap on a single upstream (api) response body
+# workers = 16                      # P-1: worker threads (default max(16, cores))
+# chain_budget_secs = 120           # P-6: total time budget across a chain's legs
+# cooldown = true                   # P-9: enable failure-aware backend cooldown
+# cooldown_secs = 60                # P-9: base cooldown for rate-limit / http failures
+# strict_models = false             # U-3: reject unknown models (404) vs fall back to default_chain
+# cors_origins = ["http://localhost:5173"]  # U-10: browser CORS allowlist (exact origins; no wildcard)
+
+# ── Per-backend optional keys ───────────────────────────────────────────────
+# All backend types:
+#   allow_empty = false             # U-6: accept an empty completion as success
+#   max_concurrent = 1              # U-20: cap simultaneous dispatches (saturated → Busy → next leg)
+#
+# type = "tmuxlet":
+#   target_args = ["--effort", "max"]   # passed through as repeated --target-arg
+#   cwd = "~"                       # working dir (tilde-expanded; default $HOME)
+#   env_pass = ["FOO_*"]            # S-3: per-backend env allowlist (overrides server default)
+#   prompt_mode = "transcript"      # U-14: transcript (default) | last_user
+#
+# type = "api":
+#   api_key_env = "OPENROUTER_API_KEY"  # env var NAME holding the key (never the key itself)
+#   extra_body = { think = true }   # shallow-merged into the upstream request body
+#   timeout_secs = 120              # per-backend dispatch timeout override
+#   ca_file = "~/.tmuxlet/lan-ca.pem"   # U-24: extra CA PEM trusted for this upstream's TLS
+#
+# type = "cli":
+#   args = ["-p", "{prompt}"]       # {prompt} placeholder lands the prompt in argv
+#   pty = false                     # U-11/U-12: run under a PTY (TTY-detecting tools)
+#   pty_size = [200, 50]            # U-12: [cols, rows] when pty = true
+#   cwd = "~"                       # working dir (tilde-expanded; default $HOME)
+#   env_pass = ["FOO_*"]            # S-3: per-backend env allowlist
+#   stdin_prompt = false            # S-4: write the prompt to stdin instead of argv
+#   prompt_mode = "transcript"      # U-14: transcript (default) | last_user
+#
+# S-4 caveat: a prompt placed in argv is visible in `ps`; prefer stdin_prompt (cli)
+# or tmuxlet's stdin form for sensitive prompts.
+
+# ── [routers.<name>] — §5 auto-router (fully opt-in; omit for no routing) ────
+# [routers.smart]
+#   classifier = "ollama-kimi"      # a defined backend that labels the task
+#   fallback_class = "execution"    # class used when classification fails / times out
+#   classifier_timeout_secs = 5     # classifier dispatch timeout
+#   classifier_max_chars = 4000     # truncate the classifier input to the last N chars
+#   classifier_prompt = "..."       # override the default classify prompt ({classes}/{input})
+#   [routers.smart.routes]          # class -> chain or backend
+#   research = "thinking"
+#   execution = "default"
+#
+# Observability: the response carries `x-tmuxlet-route: class/chain/backend`, and
+# GET /v1/backends shows per-backend health (state ok|cooling|busy|unknown).
