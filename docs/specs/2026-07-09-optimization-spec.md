@@ -184,7 +184,7 @@ Browser-based clients can't call the server (no OPTIONS handling, no CORS header
 
 ### U-13: Backend status endpoint (MEDIUM)
 `/health` is static; no way to see which chain legs are healthy, cooling, or how slow.
-**Spec:** `GET /v1/backends` (auth-gated per S-1) → JSON array: `{name, type, state: ok|cooling|unknown, consecutive_failures, last_error, last_latency_ms, cooling_until}` from the P-9 health records. Add `"version"` to `/health`.
+**Spec:** `GET /v1/backends` (auth-gated per S-1) → JSON array: `{name, type, state: ok|cooling|busy|unknown, consecutive_failures, last_error, last_latency_ms, cooling_secs}` from the P-9 health records. Add `"version"` to `/health`. **Amended (post-impl review, 2026-07-09):** `state` includes `busy` (backend at its U-20 concurrency cap right now); the countdown field is `cooling_secs` (relative seconds — `Instant` has no wall-clock form, and relative seconds are self-contained for a localhost tool) rather than the originally-specced `cooling_until`.
 
 ### U-14: Prompt shaping options (MEDIUM)
 `[System]:` vs `User:` label inconsistency; no way to send a raw prompt — coding CLIs receive `User: <text>` even for single-message requests, which changes their behavior vs. direct invocation.
@@ -208,7 +208,7 @@ Multi-part text content is joined with `""` (words glued); non-text parts (image
 
 ### U-20: Per-backend concurrency cap (MEDIUM)
 Two simultaneous requests to the same tmuxlet target spawn two tmux sessions/TUIs (hundreds of MB each; tmuxlet's own machine cap may queue or reject).
-**Spec:** optional per-backend `max_concurrent = N`; a saturated backend returns a `Busy` error class immediately so the chain advances (counts as failure for P-9 only after M consecutive rejections).
+**Spec:** optional per-backend `max_concurrent = N`; a saturated backend returns a `Busy` error class immediately so the chain advances. **Amended (post-impl review, 2026-07-09):** Busy is deliberately excluded from P-9 cooldown — a saturated backend recovers the instant a slot frees and a rejection costs microseconds, so cooling it would only delay recovery. Saturation is instead surfaced as `state: "busy"` on `GET /v1/backends` (U-13).
 
 ### U-22: Config reload (DEFERRED, adjudicated F12)
 SIGHUP-triggered reload (re-load + validate + swap `Arc<State>`; in-flight requests finish on the old config). Deferred to the roadmap tail per grok's verdict (Section 6).

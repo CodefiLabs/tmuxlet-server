@@ -349,3 +349,39 @@ fn strict_models_on_rejects_unknown_model_and_names_the_fix() {
         "404 must name both remedies: {body}"
     );
 }
+
+#[test]
+fn backends_endpoint_shape_and_ok_transition() {
+    // U-13/B5: /v1/backends reports each backend's health with cooling_secs (the
+    // deliberate rename of cooling_until). A fresh backend is "unknown"; after a
+    // successful dispatch it becomes "ok".
+    let server = common::start(&config(common::free_port()));
+    let (status, body) = common::get(&format!("{}/v1/backends", server.base));
+    assert_eq!(status, 200, "body: {body}");
+    assert!(body.contains(r#""name":"echo""#), "body: {body}");
+    assert!(body.contains(r#""type":"cli""#), "body: {body}");
+    assert!(
+        body.contains(r#""state":"unknown""#),
+        "a fresh backend is unknown: {body}"
+    );
+    for field in [
+        "consecutive_failures",
+        "last_error",
+        "last_latency_ms",
+        "cooling_secs",
+    ] {
+        assert!(body.contains(field), "missing field {field}: {body}");
+    }
+
+    // Drive one successful request, then the backend transitions to "ok".
+    let (cs, cb) = common::post_json(
+        &format!("{}/v1/chat/completions", server.base),
+        r#"{"model":"default","messages":[{"role":"user","content":"hi"}]}"#,
+    );
+    assert_eq!(cs, 200, "chat body: {cb}");
+    let (_s, body2) = common::get(&format!("{}/v1/backends", server.base));
+    assert!(
+        body2.contains(r#""state":"ok""#),
+        "backend should be ok after a success: {body2}"
+    );
+}

@@ -348,6 +348,9 @@ pub fn handle(mut req: Request, state: &Arc<State>) {
 fn respond_backends(req: Request, state: &Arc<State>) {
     let mut names: Vec<&String> = state.cfg.backends.keys().collect();
     names.sort();
+    // Snapshot the in-flight counts (U-20) before taking the health lock, so the
+    // two leaf locks are never held at once.
+    let active: HashMap<String, usize> = state.active.lock().unwrap().clone();
     let health = state.health.lock().unwrap();
     let now = Instant::now();
     let entries: Vec<serde_json::Value> = names
@@ -355,8 +358,19 @@ fn respond_backends(req: Request, state: &Arc<State>) {
         .map(|name| {
             let h = health.get(*name);
             let cooling = h.and_then(|x| x.cooling_until).filter(|u| *u > now);
+            // U-20/B4: report "busy" when the backend is at its concurrency cap
+            // right now. (Busy is deliberately excluded from P-9 cooldown — a
+            // saturated backend recovers the instant a slot frees.)
+            let busy = state
+                .backends
+                .get(*name)
+                .and_then(|b| b.max_concurrent())
+                .zip(active.get(*name))
+                .is_some_and(|(max, count)| *count >= max);
             let st = if cooling.is_some() {
                 "cooling"
+            } else if busy {
+                "busy"
             } else if h.is_some() {
                 "ok"
             } else {
