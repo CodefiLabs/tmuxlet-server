@@ -385,3 +385,185 @@ fn backends_endpoint_shape_and_ok_transition() {
         "backend should be ok after a success: {body2}"
     );
 }
+
+fn cors_multi_config(port: u16) -> String {
+    format!(
+        r#"
+[server]
+listen = "127.0.0.1:{port}"
+default_chain = "default"
+env_source = "process"
+cors_origins = ["http://a.test", "http://b.test"]
+
+[backends.echo]
+type = "cli"
+bin = "/bin/echo"
+
+[chains.default]
+order = ["echo"]
+"#
+    )
+}
+
+fn cors_auth_config(port: u16) -> String {
+    format!(
+        r#"
+[server]
+listen = "127.0.0.1:{port}"
+default_chain = "default"
+env_source = "process"
+auth = true
+auth_token_env = "TEST_AUTH_TOKEN"
+cors_origins = ["http://localhost:5173"]
+
+[backends.echo]
+type = "cli"
+bin = "/bin/echo"
+
+[chains.default]
+order = ["echo"]
+"#
+    )
+}
+
+#[test]
+fn cors_headers_present_on_error_responses() {
+    // U-10: apply_cors runs on every response, so 404 and 405 also carry ACAO+Vary
+    // for an allowed Origin (a browser needs it to read the error body).
+    let origin = "http://localhost:5173";
+    let server = common::start(&cors_config(common::free_port(), origin));
+
+    let (s404, h404, _) = common::send(
+        "GET",
+        &format!("{}/nope", server.base),
+        &[("Origin", origin)],
+    );
+    assert_eq!(s404, 404);
+    assert_eq!(
+        h404.get("access-control-allow-origin").map(String::as_str),
+        Some(origin),
+        "ACAO on 404: {h404:?}"
+    );
+    assert_eq!(
+        h404.get("vary").map(String::as_str),
+        Some("Origin"),
+        "Vary on 404: {h404:?}"
+    );
+
+    let (s405, h405, _) = common::send(
+        "DELETE",
+        &format!("{}/v1/models", server.base),
+        &[("Origin", origin)],
+    );
+    assert_eq!(s405, 405);
+    assert_eq!(
+        h405.get("access-control-allow-origin").map(String::as_str),
+        Some(origin),
+        "ACAO on 405: {h405:?}"
+    );
+}
+
+#[test]
+fn cors_header_present_on_the_sse_stream() {
+    // U-10: a streaming (SSE) response also carries ACAO for an allowed Origin.
+    let origin = "http://localhost:5173";
+    let server = common::start(&cors_config(common::free_port(), origin));
+    let (status, headers, _body) = common::send_body(
+        "POST",
+        &format!("{}/v1/chat/completions", server.base),
+        &[("Origin", origin), ("Content-Type", "application/json")],
+        r#"{"model":"default","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+    );
+    assert_eq!(status, 200);
+    assert_eq!(
+        headers
+            .get("access-control-allow-origin")
+            .map(String::as_str),
+        Some(origin),
+        "SSE must echo ACAO: {headers:?}"
+    );
+}
+
+#[test]
+fn cors_preflight_succeeds_with_auth_enabled_and_no_token() {
+    // U-10 + S-1: the OPTIONS preflight is answered BEFORE the auth gate, so a
+    // browser can preflight without a token (it can't attach one to a preflight).
+    let origin = "http://localhost:5173";
+    let server = common::start_with_env(
+        &cors_auth_config(common::free_port()),
+        &[("TEST_AUTH_TOKEN", "tok")],
+    );
+    let (status, headers, _) = common::send(
+        "OPTIONS",
+        &format!("{}/v1/chat/completions", server.base),
+        &[("Origin", origin)],
+    );
+    assert_eq!(status, 204, "preflight must not require auth");
+    assert_eq!(
+        headers
+            .get("access-control-allow-origin")
+            .map(String::as_str),
+        Some(origin)
+    );
+}
+
+#[test]
+fn cors_echoes_each_of_multiple_configured_origins() {
+    let server = common::start(&cors_multi_config(common::free_port()));
+    for origin in ["http://a.test", "http://b.test"] {
+        let (_s, h, _) = common::send(
+            "GET",
+            &format!("{}/v1/models", server.base),
+            &[("Origin", origin)],
+        );
+        assert_eq!(
+            h.get("access-control-allow-origin").map(String::as_str),
+            Some(origin),
+            "must echo {origin}: {h:?}"
+        );
+    }
+    let (_s, h, _) = common::send(
+        "GET",
+        &format!("{}/v1/models", server.base),
+        &[("Origin", "http://c.test")],
+    );
+    assert!(
+        !h.contains_key("access-control-allow-origin"),
+        "an unlisted origin must not be echoed: {h:?}"
+    );
+}
+
+#[test]
+fn cors_star_is_not_a_wildcard() {
+    // U-10 + B7: "*" is matched literally, not as a wildcard — a real Origin that
+    // isn't the literal "*" gets no ACAO.
+    let server = common::start(&cors_config(common::free_port(), "*"));
+    let (_s, h, _) = common::send(
+        "GET",
+        &format!("{}/v1/models", server.base),
+        &[("Origin", "http://anything.test")],
+    );
+    assert!(
+        !h.contains_key("access-control-allow-origin"),
+        "\"*\" must not match arbitrary origins: {h:?}"
+    );
+}
+
+#[test]
+fn body_cap_413_at_boundary() {
+    // Body cap MAX_BODY = 16 MiB: MAX+1 bytes -> 413; a MAX-byte body is not
+    // rejected by the cap (it fails later as parse_error / 400, not 413).
+    const MAX: usize = 16 * 1024 * 1024;
+    let server = common::start(&config(common::free_port()));
+    let url = format!("{}/v1/chat/completions", server.base);
+
+    let (s_over, b_over) = common::post_json(&url, &"a".repeat(MAX + 1));
+    assert_eq!(s_over, 413, "over the cap must be 413: {b_over}");
+    assert!(b_over.contains("payload_too_large"), "413 code: {b_over}");
+
+    let (s_at, _b_at) = common::post_json(&url, &"a".repeat(MAX));
+    assert_ne!(
+        s_at, 413,
+        "a body at exactly the cap must not be rejected by it"
+    );
+}
