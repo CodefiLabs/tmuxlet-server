@@ -152,9 +152,10 @@ fn read_body<R: Read>(r: &mut R, buf: &mut Vec<u8>, max_bytes: usize) -> io::Res
             Ok(n) => {
                 buf.extend_from_slice(&chunk[..n]);
                 if max_bytes != 0 && buf.len() > max_bytes {
-                    return Err(io::Error::other(format!(
-                        "response exceeds max_response_bytes cap ({max_bytes} bytes)"
-                    )));
+                    return Err(io::Error::new(
+                        io::ErrorKind::FileTooLarge,
+                        format!("response exceeds max_response_bytes cap ({max_bytes} bytes)"),
+                    ));
                 }
                 if header_end.is_none()
                     && let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n")

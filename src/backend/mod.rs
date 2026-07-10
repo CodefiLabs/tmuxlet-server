@@ -159,8 +159,14 @@ pub fn resolve_program(program: &str, env: &Env) -> PathBuf {
     PathBuf::from(program)
 }
 
+/// True if `p` is a regular file with any exec bit set (F-4). This is a
+/// permission-bit check, not an `access(2)` call: it can accept a file the
+/// current (non-root) server user cannot actually execute (e.g. exec bit only
+/// in `group`/`other`). Exact executability requires `faccessat`, which isn't
+/// worth the extra plumbing for a localhost preflight — a genuinely
+/// non-executable target fails loudly at spawn time on the next chain leg.
 #[cfg(unix)]
-fn is_executable_file(p: &Path) -> bool {
+pub(crate) fn is_executable_file(p: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(p)
         .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
@@ -168,7 +174,7 @@ fn is_executable_file(p: &Path) -> bool {
 }
 
 #[cfg(not(unix))]
-fn is_executable_file(p: &Path) -> bool {
+pub(crate) fn is_executable_file(p: &Path) -> bool {
     p.is_file()
 }
 

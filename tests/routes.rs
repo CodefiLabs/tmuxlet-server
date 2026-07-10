@@ -226,7 +226,9 @@ fn cors_preflight_204_and_echo_when_origin_allowed() {
 
 #[test]
 fn cors_absent_for_unlisted_origin_and_by_default() {
-    // U-10: an unlisted Origin gets no ACAO even on a CORS-enabled server.
+    // U-10 + E1: an unlisted Origin gets no ACAO, but a CORS-enabled server still
+    // sends `Vary: Origin` on every response so a shared cache keys on Origin and
+    // can't serve a browser from an allowed origin the cached no-ACAO body.
     let server = common::start(&cors_config(common::free_port(), "http://localhost:5173"));
     let (_s, gh, _) = common::send(
         "GET",
@@ -236,6 +238,11 @@ fn cors_absent_for_unlisted_origin_and_by_default() {
     assert!(
         !gh.contains_key("access-control-allow-origin"),
         "unlisted origin must not be echoed: {gh:?}"
+    );
+    assert_eq!(
+        gh.get("vary").map(String::as_str),
+        Some("Origin"),
+        "CORS-enabled server must Vary: Origin even for an unlisted origin: {gh:?}"
     );
 
     // And the default config (no cors_origins) never emits CORS headers.
@@ -248,6 +255,10 @@ fn cors_absent_for_unlisted_origin_and_by_default() {
     assert!(
         !ph.contains_key("access-control-allow-origin"),
         "CORS off by default: {ph:?}"
+    );
+    assert!(
+        !ph.contains_key("vary"),
+        "no CORS configured -> no Vary header: {ph:?}"
     );
 }
 

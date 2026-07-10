@@ -194,6 +194,18 @@ pub enum Backend {
     },
 }
 
+impl Backend {
+    /// The `type` discriminant as it appears in config and on `/v1/backends`.
+    /// Single source of truth so the label can't drift between call sites.
+    pub fn type_str(&self) -> &'static str {
+        match self {
+            Backend::Tmuxlet { .. } => "tmuxlet",
+            Backend::Api { .. } => "api",
+            Backend::Cli { .. } => "cli",
+        }
+    }
+}
+
 pub fn load(path: &Path) -> Result<(Config, Vec<String>), String> {
     let text = fs::read_to_string(path)
         .map_err(|e| format!("failed to read config {}: {e}", path.display()))?;

@@ -30,14 +30,15 @@ fn substitute_prompt(args: &[String], prompt: &str) -> (Vec<String>, bool) {
     (out, substituted)
 }
 
-/// For a non-PTY CLI: the prompt substituted into a `{prompt}` placeholder if
-/// present, otherwise appended as the final positional argument.
-pub fn plain_args(b: &CliBackend, prompt: &str) -> Vec<String> {
-    let (mut a, substituted) = substitute_prompt(&b.args, prompt);
+/// Build the plain (non-stdin) argv from a `substitute_prompt` result: keep the
+/// substituted args as-is, or append the prompt as the final positional argument
+/// when no `{prompt}` placeholder consumed it. Taking the precomputed result lets
+/// `dispatch` avoid substituting a second time.
+fn plain_argv(mut args: Vec<String>, substituted: bool, prompt: &str) -> Vec<String> {
     if !substituted {
-        a.push(prompt.into());
+        args.push(prompt.into());
     }
-    a
+    args
 }
 
 /// Run the CLI backend and return cleaned output. `pty=true` runs the binary in
@@ -85,16 +86,16 @@ pub fn dispatch(
         }
         cleaned
     } else {
-        // S-4: keep the prompt out of argv when stdin_prompt is set (a
-        // `{prompt}` placeholder still explicitly puts it in argv).
+        // S-4: with stdin_prompt the prompt goes to the child's stdin and stays
+        // out of argv; otherwise plain_argv substitutes/appends it, reusing the
+        // single substitution above (a `{prompt}` placeholder always wins and
+        // forces the prompt into argv).
         let (subst_args, substituted) = substitute_prompt(&b.args, prompt);
         let use_stdin = b.stdin_prompt && !substituted;
-        // Non-stdin argv uses the default construction (plain_args); stdin mode
-        // keeps the prompt out of argv entirely.
         let argv = if use_stdin {
             subst_args
         } else {
-            plain_args(b, prompt)
+            plain_argv(subst_args, substituted, prompt)
         };
         let mut child = Command::new(&b.bin)
             .args(&argv)
@@ -196,16 +197,17 @@ mod tests {
     }
 
     #[test]
-    fn plain_args_append_prompt() {
+    fn plain_argv_appends_prompt_when_no_placeholder() {
         let b = cli("x", "/bin/echo", vec!["-n".into()], false);
+        let (a, s) = substitute_prompt(&b.args, "hello");
         assert_eq!(
-            plain_args(&b, "hello"),
+            plain_argv(a, s, "hello"),
             vec!["-n".to_string(), "hello".to_string()]
         );
     }
 
     #[test]
-    fn plain_args_substitutes_placeholder_instead_of_appending() {
+    fn plain_argv_substitutes_placeholder_instead_of_appending() {
         // When `{prompt}` appears in args, the prompt is substituted there and
         // NOT also appended as a trailing positional (which would double it).
         let b = cli(
@@ -214,8 +216,9 @@ mod tests {
             vec!["-p".into(), "{prompt}".into()],
             false,
         );
+        let (a, s) = substitute_prompt(&b.args, "hello world");
         assert_eq!(
-            plain_args(&b, "hello world"),
+            plain_argv(a, s, "hello world"),
             vec!["-p".to_string(), "hello world".to_string()]
         );
     }

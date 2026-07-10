@@ -14,7 +14,6 @@ use config::Config;
 use env::Env;
 use std::collections::HashMap;
 use std::net::{TcpStream, ToSocketAddrs};
-use std::path::Path;
 use std::process::ExitCode;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -138,29 +137,6 @@ fn run_validate(args: &Args) -> ExitCode {
         ExitCode::SUCCESS
     }
 }
-
-fn backend_type(b: &config::Backend) -> &'static str {
-    match b {
-        config::Backend::Tmuxlet { .. } => "tmuxlet",
-        config::Backend::Api { .. } => "api",
-        config::Backend::Cli { .. } => "cli",
-    }
-}
-
-fn is_executable(p: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(p)
-            .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::metadata(p).map(|m| m.is_file()).unwrap_or(false)
-    }
-}
-
 /// U-5 `--check-backends`: per backend, print PASS/FAIL and a detail line.
 /// Returns true iff every backend passed.
 fn check_backends(cfg: &Config, env: &Env) -> bool {
@@ -172,7 +148,7 @@ fn check_backends(cfg: &Config, env: &Env) -> bool {
         let (ok, detail) = match b {
             config::Backend::Cli { bin, .. } => {
                 let path = std::path::PathBuf::from(bin);
-                if is_executable(&path) {
+                if backend::is_executable_file(&path) {
                     (true, path.display().to_string())
                 } else {
                     (
@@ -214,7 +190,7 @@ fn check_backends(cfg: &Config, env: &Env) -> bool {
         println!(
             "{} {name} ({}) — {detail}",
             if ok { "PASS" } else { "FAIL" },
-            backend_type(b)
+            b.type_str()
         );
         if !ok {
             all_ok = false;

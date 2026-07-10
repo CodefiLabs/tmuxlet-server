@@ -138,26 +138,46 @@ fn header(name: &str, value: &str) -> Header {
 }
 
 thread_local! {
-    // U-10: the allowed Origin to echo on this request's responses. Set once at
-    // the top of handle() (each worker thread serves one request to completion
-    // before the next), so every response builder can add the header without
-    // threading it through every call site. None = no CORS header.
-    static CORS_ORIGIN: std::cell::RefCell<Option<String>> =
-        const { std::cell::RefCell::new(None) };
+    // U-10: per-request CORS decision, set once at the top of handle() (each
+    // worker thread serves one request to completion before the next), so every
+    // response builder can add the headers without threading them through every
+    // call site. `enabled` = the server has cors_origins configured, so
+    // `Vary: Origin` must go on EVERY response for cache correctness behind a
+    // shared proxy — even when this request's Origin didn't match. `origin` = the
+    // allowlisted Origin to echo via Access-Control-Allow-Origin, if it matched.
+    static CORS: std::cell::RefCell<CorsState> =
+        const { std::cell::RefCell::new(CorsState::DISABLED) };
+}
+struct CorsState {
+    enabled: bool,
+    origin: Option<String>,
 }
 
-fn set_cors_origin(o: Option<String>) {
-    CORS_ORIGIN.with(|c| *c.borrow_mut() = o);
+impl CorsState {
+    const DISABLED: CorsState = CorsState {
+        enabled: false,
+        origin: None,
+    };
 }
 
-/// U-10: add `Access-Control-Allow-Origin` when the request's Origin is
-/// allowlisted. Applied to every response so browsers can read them.
+fn set_cors(enabled: bool, origin: Option<String>) {
+    CORS.with(|c| *c.borrow_mut() = CorsState { enabled, origin });
+}
+
+/// U-10: when CORS is enabled, add `Vary: Origin` to every response (cache
+/// correctness), plus `Access-Control-Allow-Origin` when this request's Origin
+/// was allowlisted. A no-op when CORS is disabled.
 fn apply_cors<R: Read>(resp: Response<R>) -> Response<R> {
-    CORS_ORIGIN.with(|c| match c.borrow().as_deref() {
-        Some(o) => resp
-            .with_header(header("Access-Control-Allow-Origin", o))
-            .with_header(header("Vary", "Origin")),
-        None => resp,
+    CORS.with(|c| {
+        let s = c.borrow();
+        if !s.enabled {
+            return resp;
+        }
+        let resp = resp.with_header(header("Vary", "Origin"));
+        match s.origin.as_deref() {
+            Some(o) => resp.with_header(header("Access-Control-Allow-Origin", o)),
+            None => resp,
+        }
     })
 }
 
@@ -198,14 +218,6 @@ fn respond_405(req: Request, allow: &str) {
     let _ = req.respond(apply_cors(resp));
 }
 
-fn backend_type_str(b: &crate::config::Backend) -> &'static str {
-    match b {
-        crate::config::Backend::Tmuxlet { .. } => "tmuxlet",
-        crate::config::Backend::Api { .. } => "api",
-        crate::config::Backend::Cli { .. } => "cli",
-    }
-}
-
 pub fn handle(mut req: Request, state: &Arc<State>) {
     let method = match req.method() {
         Method::Get => "GET",
@@ -228,22 +240,23 @@ pub fn handle(mut req: Request, state: &Arc<State>) {
         .find(|h| h.field.equiv("Origin"))
         .map(|h| h.value.as_str().to_string());
     let allowed = origin.filter(|o| state.cfg.server.cors_origins.iter().any(|a| a == o));
-    set_cors_origin(allowed.clone());
-    if method == "OPTIONS" && !state.cfg.server.cors_origins.is_empty() {
-        // CORS preflight: 204, echoing the origin + allowed methods/headers.
+    let cors_enabled = !state.cfg.server.cors_origins.is_empty();
+    set_cors(cors_enabled, allowed.clone());
+    if method == "OPTIONS" && cors_enabled {
+        // CORS preflight: 204. apply_cors echoes the Origin (ACAO) and adds Vary;
+        // the preflight-only headers (allowed methods/headers, max-age) go on when
+        // the Origin matched the allowlist.
         let mut resp = Response::empty(StatusCode(204));
-        if let Some(o) = &allowed {
+        if allowed.is_some() {
             resp = resp
-                .with_header(header("Access-Control-Allow-Origin", o))
                 .with_header(header("Access-Control-Allow-Methods", "GET, POST, OPTIONS"))
                 .with_header(header(
                     "Access-Control-Allow-Headers",
                     "authorization, content-type",
                 ))
-                .with_header(header("Access-Control-Max-Age", "600"))
-                .with_header(header("Vary", "Origin"));
+                .with_header(header("Access-Control-Max-Age", "600"));
         }
-        let _ = req.respond(resp);
+        let _ = req.respond(apply_cors(resp));
         return;
     }
     let route = classify(method, &path);
@@ -378,7 +391,7 @@ fn respond_backends(req: Request, state: &Arc<State>) {
             };
             serde_json::json!({
                 "name": name,
-                "type": backend_type_str(&state.cfg.backends[*name]),
+                "type": state.cfg.backends[*name].type_str(),
                 "state": st,
                 "consecutive_failures": h.map(|x| x.consecutive_failures).unwrap_or(0),
                 "last_error": h.and_then(|x| x.last_error.clone()),

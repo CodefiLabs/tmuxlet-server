@@ -112,8 +112,9 @@ pub fn dispatch(
     .map_err(|e| {
         let m = e.to_string();
         // S-5: an over-cap response is a Parse-class failure (chain advances);
-        // everything else (connect/read) is Spawn-class.
-        if m.contains("max_response_bytes") {
+        // everything else (connect/read) is Spawn-class. The cap is signalled by
+        // ErrorKind::FileTooLarge, not the message text.
+        if e.kind() == std::io::ErrorKind::FileTooLarge {
             BackendError::Parse(b.name.clone(), m)
         } else {
             BackendError::Spawn(b.name.clone(), m)
