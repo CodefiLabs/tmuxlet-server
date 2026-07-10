@@ -60,6 +60,12 @@ pub fn resolve(
     if let Ok(existing) = fs::read_to_string(token_file) {
         let t = existing.trim().to_string();
         if !t.is_empty() {
+            // S-1: `.mode()` in write_token only secures files it *creates*, so a
+            // token provisioned out-of-band (`echo tok > ~/.tmuxlet/token` under
+            // umask 022) or restored from backup can be group/world-readable. The
+            // reuse path never wrote it, so re-secure it here — forgiving-serve:
+            // repair and warn rather than refuse a working token.
+            repair_token_perms(token_file);
             return Ok(Some(t));
         }
     }
@@ -77,22 +83,41 @@ pub fn resolve(
     Ok(Some(token))
 }
 
+/// S-1: force an existing token file back to 0600 if it is group/world-
+/// accessible. Used on the reuse path, where `write_token`'s create-time mode
+/// never applied.
+#[cfg(unix)]
+fn repair_token_perms(p: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(meta) = fs::metadata(p) {
+        let mode = meta.permissions().mode();
+        if mode & 0o077 != 0 && fs::set_permissions(p, fs::Permissions::from_mode(0o600)).is_ok() {
+            eprintln!(
+                "[warn] auth: re-secured token file {} from mode {:o} to 0600 (was group/world-accessible)",
+                p.display(),
+                mode & 0o777
+            );
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn repair_token_perms(_p: &Path) {}
+
 #[cfg(unix)]
 fn write_token(p: &Path, token: &str) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
-    use std::os::unix::fs::PermissionsExt;
-    // Create with 0600 from the start (no default-umask window).
+    // Truncating a pre-existing file in place reuses its inode, so a process
+    // holding an fd on the old world-readable file could read the freshly
+    // generated secret. Remove it first, then create a NEW inode that is 0600
+    // from birth — no in-place truncate, no default-umask window (S-1).
+    let _ = fs::remove_file(p);
     let mut f = fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
         .open(p)?;
-    // `.mode()` is honored only when open(2) CREATES the file; a pre-existing
-    // token file keeps its old (possibly world-readable) mode. Force 0600 so the
-    // secret is never left group/world-readable (S-1).
-    f.set_permissions(fs::Permissions::from_mode(0o600))?;
     f.write_all(token.as_bytes())
 }
 
@@ -160,25 +185,45 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn resolve_repairs_a_world_readable_pre_existing_token_file() {
-        // S-1: open(2)'s mode arg is ignored for an existing file, so a stale
-        // 0644 token file must be forced back to 0600 when a token is written.
+    fn resolve_repairs_perms_on_a_reused_nonempty_token_file() {
+        // A1/S-1: a token provisioned out-of-band as world-readable is reused
+        // verbatim (restarts must not invalidate clients) but re-secured to 0600.
+        // This is the gap the old empty-file test masked — an empty file hits the
+        // regenerate path, never the reuse path.
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("tmuxlet-auth-perm-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tmuxlet-auth-reuse-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("token");
-        // Empty + world-readable: resolve() regenerates and rewrites it.
+        std::fs::write(&file, b"preexisting-token-abc\n").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let env = Env::capture("process", "", 5);
+        let t = resolve(true, None, &env, &file).unwrap().unwrap();
+        assert_eq!(t, "preexisting-token-abc", "reused token returned verbatim");
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "reused token must be re-secured to 0600, got {mode:o}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolve_regenerates_empty_token_file_as_0600() {
+        // A6/S-1: an empty stale file is regenerated on a fresh inode at 0600.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("tmuxlet-auth-regen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("token");
         std::fs::write(&file, b"").unwrap();
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
         let env = Env::capture("process", "", 5);
         let t = resolve(true, None, &env, &file).unwrap().unwrap();
         assert_eq!(t.len(), 64);
         let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
-        assert_eq!(
-            mode, 0o600,
-            "token must be re-secured to 0600, got {mode:o}"
-        );
+        assert_eq!(mode, 0o600, "regenerated token must be 0600, got {mode:o}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
