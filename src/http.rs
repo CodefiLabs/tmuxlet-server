@@ -721,19 +721,27 @@ fn record_success(state: &State, name: &str, latency_ms: u64) {
 }
 
 fn record_failure(state: &State, name: &str, err: &BackendError, latency_ms: u64) {
-    let mut h = state.health.lock().unwrap();
-    let e = h.entry(name.to_string()).or_default();
-    e.consecutive_failures = e.consecutive_failures.saturating_add(1);
-    e.last_error = Some(err.to_string());
-    e.last_latency_ms = Some(latency_ms);
-    if state.cfg.server.cooldown {
-        let cd = cooldown_for(err, e.consecutive_failures, state.cfg.server.cooldown_secs);
-        e.cooling_until = Some(Instant::now() + cd);
-        log::info(&format!(
-            "cooldown {name} for {}s ({})",
-            cd.as_secs(),
-            err.class()
-        ));
+    // A4: mutate health under the lock, then RELEASE it before logging. log::line
+    // can block on a stalled stderr pipe; blocking (or, before the log.rs fix,
+    // panicking on EPIPE) while holding state.health would stall or poison the
+    // mutex and brick every later request.
+    let cooldown_log = {
+        let mut h = state.health.lock().unwrap();
+        let e = h.entry(name.to_string()).or_default();
+        e.consecutive_failures = e.consecutive_failures.saturating_add(1);
+        e.last_error = Some(err.to_string());
+        e.last_latency_ms = Some(latency_ms);
+        if state.cfg.server.cooldown {
+            let cd = cooldown_for(err, e.consecutive_failures, state.cfg.server.cooldown_secs);
+            // checked_add: an absurd cooldown_secs would overflow Instant.
+            e.cooling_until = Instant::now().checked_add(cd);
+            Some((cd.as_secs(), err.class()))
+        } else {
+            None
+        }
+    };
+    if let Some((secs, class)) = cooldown_log {
+        log::info(&format!("cooldown {name} for {secs}s ({class})"));
     }
 }
 

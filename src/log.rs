@@ -30,9 +30,23 @@ fn ts() -> u64 {
 }
 
 fn line(level: u8, tag: &str, msg: &str) {
-    if enabled(level) {
-        eprintln!("{} {tag} {msg}", ts());
+    if !enabled(level) {
+        return;
     }
+    // A4: eprintln! panics on EPIPE (a closed stderr) and blocks on a stalled
+    // pipe; a panic here — often under the health lock — would poison that mutex
+    // and brick every later request. Write to a locked handle and swallow errors.
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr().lock(), "{} {tag} {}", ts(), sanitize(msg));
+}
+
+/// A5 (CWE-117): strip control characters so client-controlled strings (model
+/// names, upstream error bodies) can't forge a second log line via `\n` or drive
+/// the operator's terminal via ANSI escapes.
+fn sanitize(msg: &str) -> String {
+    msg.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
 }
 
 pub fn error(msg: &str) {
@@ -52,4 +66,25 @@ pub fn debug(msg: &str) {
 pub fn next_reqid() -> String {
     let n = REQ_COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{n:06x}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_strips_control_and_ansi() {
+        // A5: a model name carrying a newline + ANSI escape must collapse to one
+        // clean line — no forged log entry, no terminal control.
+        let dirty = "claude-3\nInjected: fake\x1b[31m red\ttab\x07bell";
+        let clean = sanitize(dirty);
+        assert!(
+            !clean.chars().any(|c| c.is_control()),
+            "no control bytes must remain: {clean:?}"
+        );
+        assert!(!clean.contains('\n'));
+        assert!(!clean.contains('\x1b'));
+        assert!(clean.contains("claude-3"));
+        assert!(clean.contains("Injected: fake"));
+    }
 }
