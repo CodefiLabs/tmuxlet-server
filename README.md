@@ -41,19 +41,38 @@ For step-by-step install + service setup + verification, see
 
 | Method | Path | Behavior |
 |---|---|---|
-| `GET` | `/health` | `{"status":"ok","backends":N,"chains":M}` |
+| `GET` | `/health` | `{"status":"ok","version":"…","backends":N,"chains":M}` |
 | `GET` | `/v1/models` | OpenAI-compatible list of chain + backend names |
+| `GET` | `/v1/backends` | per-backend health: `state` (ok\|cooling\|busy\|unknown), consecutive_failures, last_error, last_latency_ms, cooling_secs |
 | `POST` | `/v1/chat/completions` | OpenAI chat completions (JSON or SSE) |
 
-Reserved namespaces (`/`, `/ui/*`, `/api/*`) return `501` for a future web UI;
-everything else returns `404`. Errors use the OpenAI error envelope.
+Reserved namespaces (`/`, `/ui/*`, `/api/*`) return `501` for a future web UI. A
+known path reached with the wrong method returns `405` with an `Allow` header
+(not `404`); `HEAD` on a GET route mirrors GET with an empty body. Everything
+else returns `404`. Errors use the OpenAI error envelope.
+
+The `usage` object in completions reports zeros
+(`prompt_tokens`/`completion_tokens`/`total_tokens` = 0) deliberately: the
+backends don't report token counts, and fabricated `len/4` estimates would feed
+cost trackers plausible-but-wrong numbers, so zeros mean "no data".
+
+## Auth (optional)
+
+Auth is off by default. With `[server] auth = true`, the server generates a
+32-byte token into `~/.tmuxlet/token` (mode `0600`) — unless `auth_token_env`
+names an env var holding the token — and clients send
+`Authorization: Bearer <token>` on `/v1/*` (missing/invalid → `401
+unauthorized`). `/health` stays open (no token) for liveness probes.
+`cat ~/.tmuxlet/token` is the whole client setup.
 
 ## Streaming limitation (V1)
 
 V1 backends are blocking: `cli`/`tmuxlet` emit output only after the child
-exits, and `api` is a single non-streamed call. So with `stream: true` the SSE
-frames (role-prime → content → final → `[DONE]`) are emitted all at once after
-the full response is ready. True incremental streaming is V2.
+exits, and `api` is a single non-streamed call. So with `stream: true` the
+server sends the `200` status and SSE headers immediately, then emits
+`: keepalive` comment frames every 15s while the backend runs; once the response
+is ready the real frames (role-prime → content → final → `[DONE]`) are emitted
+all at once. True incremental token streaming is V2.
 
 ## Dependency budget
 
@@ -64,11 +83,14 @@ echo). ~25 crates including transitive.
 
 ## Status
 
-**V1 complete.** All three backend `dispatch` functions
-(`src/backend/{tmuxlet,api,cli}.rs`) are implemented and tested; `/health`,
-`/v1/models`, and `/v1/chat/completions` (streaming and non-streaming) all work,
-as does the fallback chain. CI (`fmt + clippy + test`) is green on macOS and
-Linux. See [`docs/STATUS.md`](./docs/STATUS.md) for the verification summary and
+**V1 complete**, plus the optimization spec (auto-router, per-backend
+concurrency caps, failure-aware cooldown, CORS, optional auth, prompt shaping,
+custom-CA TLS, HEAD/405) implemented on top. All three backend `dispatch`
+functions (`src/backend/{tmuxlet,api,cli}.rs`) are implemented and tested;
+`/health`, `/v1/models`, `/v1/backends`, and `/v1/chat/completions` (streaming
+and non-streaming) all work, as does the fallback chain. CI (`fmt + clippy +
+test`) is green on macOS and Linux. See [`docs/STATUS.md`](./docs/STATUS.md) for
+the verification summary and
 [`docs/superpowers/plans/2026-05-28-tmuxlet-server.md`](./docs/superpowers/plans/2026-05-28-tmuxlet-server.md)
 for the design.
 

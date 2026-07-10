@@ -8,9 +8,11 @@ expected outcome, and a verification you must run before moving on. Do not ask
 the user questions you can answer by running a command.
 
 > **Status:** V1 complete. All three backend `dispatch` functions
-> (`src/backend/{tmuxlet,api,cli}.rs`) are implemented and tested; `/health`,
-> `/v1/models`, and `/v1/chat/completions` (streaming and non-streaming) all
-> work. See the implementation plan at
+> (`src/backend/{tmuxlet,api,cli}.rs`) are implemented and tested, and the
+> optimization spec (auto-router, per-backend concurrency caps, cooldown,
+> optional bearer auth, CORS, prompt shaping, custom-CA TLS, HEAD/405) is also
+> implemented; `/health`, `/v1/models`, and `/v1/chat/completions` (streaming
+> and non-streaming) all work. See the implementation plan at
 > `docs/superpowers/plans/2026-05-28-tmuxlet-server.md` for design details.
 
 ## Step 1: Verify prerequisites
@@ -92,7 +94,7 @@ systemctl --user status tmuxlet-server    # verification
 ```
 curl -fsS http://127.0.0.1:3456/health
 ```
-Expected: `{"status":"ok","backends":N,"chains":M}`.
+Expected: `{"status":"ok","version":"…","backends":N,"chains":M}`.
 
 ```
 curl -fsS -X POST http://127.0.0.1:3456/v1/chat/completions \
@@ -104,9 +106,12 @@ Expected: a chat completion JSON with non-empty `choices[0].message.content`.
 
 ## Step 7: Wire downstream clients
 
-Point any OpenAI-compatible client at `http://127.0.0.1:3456/v1` with any API
-key (auth is not checked in V1). The `model` field selects a chain name (e.g.
-`default`, `thinking`) or a single backend name.
+Point any OpenAI-compatible client at `http://127.0.0.1:3456/v1`. Auth is OFF
+by default, so any (or an empty) API key works; but if the config sets
+`[server] auth = true` the client MUST send the bearer token — it lives in
+`~/.tmuxlet/token` (run `cat ~/.tmuxlet/token`) or in the env var named by
+`auth_token_env`. The `model` field selects a chain name (e.g. `default`,
+`thinking`) or a single backend name.
 
 ## Troubleshooting
 
@@ -114,7 +119,8 @@ key (auth is not checked in V1). The `model` field selects a chain name (e.g.
 |---|---|
 | `cargo install` fails: `recursion limit reached` in `dispatch2` | you omitted `--locked`; re-run the Step 2 command with `--locked` so the pinned `dispatch2 0.3.0` is used instead of the broken `0.3.1` |
 | `failed to bind 127.0.0.1:3456` | another process owns the port; change `[server] listen` |
-| chat returns `503 all_backends_failed` | read the `detail` array; each entry names the backend and its error |
+| chat returns `503 all_backends_failed` | read the `error.details` array; each entry names the backend and its error |
 | `agy` leg always fails / `spawn failed` | `agy` symlink is broken — install Antigravity.app |
 | api backend `HTTP 401` | the `api_key_env` var is unset in the captured env; check Step 5 startup note |
 | startup hangs ~seconds | interactive-shell env capture; set `env_source = "process"` |
+| chat returns `401 unauthorized` | auth is enabled (`[server] auth = true`); send `Authorization: Bearer $(cat ~/.tmuxlet/token)` (or the token from your `auth_token_env` var). `/health` stays open without a token |

@@ -1,16 +1,19 @@
 # tmuxlet-server — Status & Next Steps
 
-_Last updated: 2026-07-09_
+_Last updated: 2026-07-10_
 
 ## TL;DR
 
-**V1 plus the optimization spec (Phases 1–4) is complete and verified.** The
-`2026-07-09-optimization-spec.md` roadmap is implemented end-to-end on top of
-v0.1.1; CI gates are green.
+**V1 plus the optimization spec is complete, verified, and hardened by a
+second (post-implementation) review.** Phases 1–3 and Phase 4's opt-in items
+(U-10 / U-14 / U-17 / U-19 / U-24) are implemented end-to-end on top of v0.1.1;
+Phase 4's V2 items (true streaming, P-7, U-22, P-4) remain deferred. A second
+adversarial review (2026-07-10) then found and fixed two behavioral gaps plus a
+test/documentation debt — see "Post-implementation review" below. CI gates are green.
 
 - **Repo:** https://github.com/CodefiLabs/tmuxlet-server
 - **Branch:** `feat/optimization-spec` (based on `origin/main` = v0.1.1)
-- **Tests:** 93 passing (65 unit + 28 integration across 8 binaries)
+- **Tests:** 128 passing (81 unit + 47 integration across 10 binaries)
 - **Gates:** `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, full suite — all clean
 - **Spec:** [`docs/specs/2026-07-09-optimization-spec.md`](specs/2026-07-09-optimization-spec.md)
 
@@ -76,6 +79,54 @@ accepted. **5 confirmed findings — all fixed with regression tests:**
   keeps scanning (execvp semantics).
 
 The earlier 6-lens V1 review (18 issues, all fixed) remains in git history.
+
+## Post-implementation review & remediation (2026-07-10)
+
+A second, larger adversarial review (6 finder dimensions → severity-scaled refuter
+panels) swept the full `feat/optimization-spec` diff, including the fix commit the
+first pass never re-reviewed. 43 findings confirmed, 1 refuted; all actioned
+findings are fixed with guard tests. Plan:
+[`docs/plans/2026-07-09-review-remediation-plan.md`](plans/2026-07-09-review-remediation-plan.md).
+
+**Behavioral / security fixes (Phase A):**
+
+- **S-1 (reuse path):** the 0600 repair ran only when a token was *written*, so a
+  pre-existing world-readable token file *with content* was reused as the live
+  bearer secret and never re-secured. Now re-secured to 0600 on reuse; `write_token`
+  also creates a fresh inode instead of truncating in place (no fd-reuse leak).
+- **U-20 (RAII slots):** `run_chain` and the classifier gate leaked `state.active`
+  slots on a dispatch panic (the server survives panics via F-3), permanently
+  bricking a `max_concurrent = 1` backend until restart. Replaced both manual
+  acquire/release pairs with an `ActiveSlot` guard that releases on Drop; the
+  `Instant` deadline arithmetic is clamped so an absurd timeout can't panic at all.
+- **Streaming panic recovery:** a panic on the SSE dispatch thread ended the
+  already-committed 200 stream at clean EOF (no error, no `[DONE]`); now mapped to
+  the same in-band 503 + `[DONE]` the non-streaming path returns.
+- **Logging:** `log::line` no longer panics on EPIPE and no longer runs while the
+  health lock is held (either would brick every later request); control characters
+  are sanitized at the sink (CWE-117 log forging).
+
+**Spec-compliance (Phase B):** `x-tmuxlet-route` now carries the winning backend
+(`class/chain/backend`); the router log line uses the real router name and a
+per-request summary line (`status=ok|fallback|fail`, emitted even on total
+failure) was added; the `strict_models` 404 and the `cors_origins` / `log_level`
+lints now name their one-line fix.
+
+**Spec amendments (recorded in the spec):**
+
+- **U-20 / P-9:** `Busy` is deliberately excluded from cooldown — a saturated
+  backend recovers the instant a slot frees and a rejection costs microseconds, so
+  cooling it would only delay recovery. Saturation is surfaced as `state: "busy"`
+  on `/v1/backends` instead.
+- **U-13:** the countdown field is `cooling_secs` (relative seconds; `Instant` has
+  no wall-clock form) rather than the originally-specced `cooling_until`.
+
+**Test & doc debt (Phases C–D):** ~14 new tests closed the gaps where whole
+features (the auth gate, U-20 caps, `strict_models`, `/v1/backends`, S-6
+redaction, the U-24 TLS happy path, F-3 panic survival) could be reverted with CI
+staying green; README, AGENTS.md, and `examples/server.toml` (now a commented
+reference block for every optional key, guarded by a lint-clean test) were brought
+up to date.
 
 ## Deferred to V2 (by spec, not bugs)
 
