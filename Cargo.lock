@@ -754,7 +754,7 @@ dependencies = [
 
 [[package]]
 name = "tmuxlet-server"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "ctrlc",
  "nix 0.28.0",
