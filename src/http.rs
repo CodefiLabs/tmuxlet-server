@@ -941,6 +941,23 @@ fn truncate_tail(s: &str, max: usize) -> String {
     chars[chars.len() - max..].iter().collect()
 }
 
+/// F-3: run one request handler, recovering from a panic so the worker loop
+/// survives (a panic that escaped would silently shrink capacity). Returns true
+/// if the handler panicked and was recovered, false on clean completion.
+fn handle_recovering<F: FnOnce()>(f: F) -> bool {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(()) => false,
+        Err(p) => {
+            let msg = p
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| p.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".into());
+            log::error(&format!("worker recovered from panic: {msg}"));
+            true
+        }
+    }
+}
 pub fn serve(server: Arc<Server>, state: Arc<State>, workers: usize) {
     let mut handles = Vec::with_capacity(workers);
     for _ in 0..workers {
@@ -951,16 +968,7 @@ pub fn serve(server: Arc<Server>, state: Arc<State>, workers: usize) {
                 // F-3: a panic while handling one request must not tear down the
                 // worker (which would silently shrink capacity).
                 let st = &state;
-                let result =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle(req, st)));
-                if let Err(p) = result {
-                    let msg = p
-                        .downcast_ref::<&str>()
-                        .map(|s| s.to_string())
-                        .or_else(|| p.downcast_ref::<String>().cloned())
-                        .unwrap_or_else(|| "unknown panic".into());
-                    log::error(&format!("worker recovered from panic: {msg}"));
-                }
+                handle_recovering(|| handle(req, st));
             }
         }));
     }
@@ -1105,5 +1113,46 @@ mod tests {
             body.contains("all_backends_failed"),
             "panic body must render as all_backends_failed: {body}"
         );
+    }
+
+    #[test]
+    fn build_503_body_redacts_upstream_detail() {
+        // S-6: redact=true drops the per-leg upstream detail but keeps the
+        // name+class summary and the all_backends_failed code.
+        let errs = vec![
+            BackendError::Http("ollama".into(), 500, "secret upstream trace".into()),
+            BackendError::Timeout("claude".into()),
+        ];
+        let redacted = build_503_body(&errs, true);
+        assert!(redacted.contains("all_backends_failed"), "{redacted}");
+        assert!(
+            redacted.contains("ollama (http error)"),
+            "redacted keeps name+class: {redacted}"
+        );
+        assert!(
+            !redacted.contains("secret upstream trace"),
+            "redacted must not leak upstream text: {redacted}"
+        );
+        let full = build_503_body(&errs, false);
+        assert!(
+            full.contains("secret upstream trace"),
+            "unredacted keeps the detail: {full}"
+        );
+    }
+
+    #[test]
+    fn worker_recovers_from_a_panicking_handler() {
+        // F-3: a panicking handler is caught so the worker loop survives (an
+        // escaped panic would permanently shrink capacity).
+        assert!(
+            handle_recovering(|| panic!("handler boom")),
+            "a panic must be reported as recovered"
+        );
+        let mut ran = false;
+        assert!(
+            !handle_recovering(|| ran = true),
+            "a clean handler reports no panic"
+        );
+        assert!(ran, "the clean handler must have executed");
     }
 }
