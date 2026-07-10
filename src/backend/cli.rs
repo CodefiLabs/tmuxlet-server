@@ -134,7 +134,7 @@ pub fn dispatch(
             let _ = std::io::Read::read_to_end(&mut err, &mut s);
             let _ = etx.send(s);
         });
-        let deadline = Instant::now() + timeout;
+        let deadline = super::poll_deadline(timeout);
         let status = loop {
             match child
                 .try_wait()

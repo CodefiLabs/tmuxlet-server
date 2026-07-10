@@ -101,7 +101,7 @@ pub fn dispatch(
     });
 
     // Server-side watchdog backstop; tmuxlet also self-limits via --timeout.
-    let deadline = Instant::now() + timeout + Duration::from_secs(5);
+    let deadline = super::poll_deadline(timeout.saturating_add(Duration::from_secs(5)));
     let status = loop {
         match child
             .try_wait()

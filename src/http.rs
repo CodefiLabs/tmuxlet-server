@@ -494,6 +494,29 @@ fn handle_chat(req: Request, raw: &str, state: &Arc<State>) {
     }
 }
 
+/// A3: run the streaming dispatch, converting a panic into an in-band chain
+/// error. Without this, a panic on the dispatch thread drops `rtx` silently and
+/// the coordinator ends the already-committed 200 SSE stream at clean EOF — no
+/// error, no `data: [DONE]`, indistinguishable from an empty success. The server
+/// is built to survive dispatch panics (F-3), so map them to the same 503 body
+/// the non-streaming path returns.
+fn dispatch_or_panic_error<F>(reqid: &str, f: F) -> Result<DispatchResult, Vec<BackendError>>
+where
+    F: FnOnce() -> Result<DispatchResult, Vec<BackendError>>,
+{
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(r) => r,
+        Err(_) => {
+            log::error(&format!(
+                "{reqid} streaming dispatch panicked; emitting in-band 503"
+            ));
+            Err(vec![BackendError::Backend(
+                "chain".to_string(),
+                "internal panic during dispatch".to_string(),
+            )])
+        }
+    }
+}
 /// U-2: stream `: keepalive` comment frames every 15s while the chain runs on a
 /// separate thread, then the final completion (or an in-band error) frames.
 #[allow(clippy::too_many_arguments)]
@@ -515,15 +538,17 @@ fn stream_with_keepalive(
     let reqid2 = reqid.clone();
     std::thread::spawn(move || {
         let names_ref: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
-        let r = run_chain(
-            &state_dispatch,
-            &names_ref,
-            &prompt,
-            &last_user,
-            &raw_value,
-            default_to,
-            &reqid2,
-        );
+        let r = dispatch_or_panic_error(&reqid2, || {
+            run_chain(
+                &state_dispatch,
+                &names_ref,
+                &prompt,
+                &last_user,
+                &raw_value,
+                default_to,
+                &reqid2,
+            )
+        });
         let _ = rtx.send(r);
     });
     std::thread::spawn(move || {
@@ -592,7 +617,8 @@ fn run_chain(
         .cfg
         .server
         .chain_budget_secs
-        .map(|b| start + Duration::from_secs(b));
+        // checked_add: an absurd budget would overflow Instant; treat as unbounded.
+        .and_then(|b| start.checked_add(Duration::from_secs(b)));
 
     // P-9: snapshot cooling status per candidate.
     let cooling: Vec<Option<Duration>> = names
@@ -970,6 +996,20 @@ mod tests {
             *active.lock().unwrap().get("b").unwrap(),
             0,
             "slot must be freed after an unwind"
+        );
+    }
+
+    #[test]
+    fn dispatch_panic_becomes_in_band_503() {
+        // A3: a panicking dispatch maps to an all_backends_failed body (which the
+        // streaming coordinator then wraps with data: [DONE]) — never a silent
+        // clean-EOF stream.
+        let r = dispatch_or_panic_error("test", || panic!("boom"));
+        let errs = r.expect_err("panic must become an error result");
+        let body = build_503_body(&errs, false);
+        assert!(
+            body.contains("all_backends_failed"),
+            "panic body must render as all_backends_failed: {body}"
         );
     }
 }

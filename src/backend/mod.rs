@@ -6,7 +6,7 @@ use crate::config;
 use crate::env::Env;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Debug)]
 pub struct DispatchResult {
@@ -170,6 +170,18 @@ fn is_executable_file(p: &Path) -> bool {
 #[cfg(not(unix))]
 fn is_executable_file(p: &Path) -> bool {
     p.is_file()
+}
+
+/// Compute a poll deadline `now + timeout` that cannot panic on an absurd
+/// timeout (e.g. a huge configured `request_timeout_secs`). `Instant` has no
+/// wall-clock maximum, so an overflow falls back to ~1 year out — effectively
+/// unbounded for a localhost tool, and never an already-expired deadline.
+pub(crate) fn poll_deadline(timeout: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(timeout).unwrap_or_else(|| {
+        now.checked_add(Duration::from_secs(365 * 24 * 3600))
+            .unwrap_or(now)
+    })
 }
 
 /// Server-level values threaded into each runtime backend at build time.
