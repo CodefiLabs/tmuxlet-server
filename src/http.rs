@@ -92,6 +92,47 @@ pub struct State {
     pub active: Mutex<HashMap<String, usize>>,
 }
 
+/// U-20: RAII guard for a `state.active` concurrency slot. `try_acquire`
+/// increments the in-flight count under the backend's cap (returning `None` when
+/// already at the cap); `Drop` decrements it. Because the server is built to
+/// survive dispatch panics (F-3 `catch_unwind` in `serve`), this guard is what
+/// keeps a panic between acquire and release from leaking the slot forever — one
+/// leak would brick a `max_concurrent = 1` backend until restart.
+struct ActiveSlot<'a> {
+    active: &'a Mutex<HashMap<String, usize>>,
+    name: String,
+}
+
+impl<'a> ActiveSlot<'a> {
+    /// Reserve one slot for `name` under `max`. `None` if already at capacity.
+    fn try_acquire(
+        active: &'a Mutex<HashMap<String, usize>>,
+        name: &str,
+        max: usize,
+    ) -> Option<Self> {
+        let mut counts = active.lock().unwrap();
+        let count = counts.entry(name.to_string()).or_insert(0);
+        if *count >= max {
+            return None;
+        }
+        *count += 1;
+        Some(Self {
+            active,
+            name: name.to_string(),
+        })
+    }
+}
+
+impl Drop for ActiveSlot<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut counts) = self.active.lock()
+            && let Some(c) = counts.get_mut(&self.name)
+        {
+            *c = c.saturating_sub(1);
+        }
+    }
+}
+
 fn header(name: &str, value: &str) -> Header {
     Header::from_bytes(name.as_bytes(), value.as_bytes()).expect("valid header")
 }
@@ -594,17 +635,18 @@ fn run_chain(
             }
         }
         let backend = &state.backends[name];
-        // U-20: concurrency cap.
-        let has_cap = backend.max_concurrent();
-        if let Some(max) = has_cap {
-            let mut active = state.active.lock().unwrap();
-            let count = active.entry(name.to_string()).or_insert(0);
-            if *count >= max {
-                errors.push(BackendError::Busy(name.to_string()));
-                continue;
-            }
-            *count += 1;
-        }
+        // U-20: reserve a concurrency slot (RAII: released on Drop, even on a
+        // dispatch panic). At the cap this leg is Busy and the chain advances.
+        let _slot = match backend.max_concurrent() {
+            Some(max) => match ActiveSlot::try_acquire(&state.active, name, max) {
+                Some(slot) => Some(slot),
+                None => {
+                    errors.push(BackendError::Busy(name.to_string()));
+                    continue;
+                }
+            },
+            None => None,
+        };
         // P-6: clamp the leg timeout to the remaining budget.
         let leg_to = backend.timeout_override().unwrap_or(default_to);
         let timeout = match budget_deadline {
@@ -618,12 +660,6 @@ fn run_chain(
         };
         let result = backend.dispatch(leg_prompt, raw_value, &state.env, timeout);
         let elapsed_ms = leg_start.elapsed().as_millis() as u64;
-        if has_cap.is_some() {
-            let mut active = state.active.lock().unwrap();
-            if let Some(c) = active.get_mut(name) {
-                *c = c.saturating_sub(1);
-            }
-        }
         match result {
             Ok(res) => {
                 if res.content.trim().is_empty() && !backend.allow_empty() {
@@ -743,26 +779,18 @@ fn classify_task(
     // U-20: honor the classifier backend's concurrency cap. At capacity, degrade
     // to the fallback class rather than spawning an uncounted session (the same
     // cap run_chain enforces on chain legs). Routing never fails the request.
-    let cap = classifier.max_concurrent();
-    if let Some(max) = cap {
-        let mut active = state.active.lock().unwrap();
-        let count = active.entry(router_cfg.classifier.clone()).or_insert(0);
-        if *count >= max {
-            return (router_cfg.fallback_class.clone(), 0);
-        }
-        *count += 1;
-    }
+    let _slot = match classifier.max_concurrent() {
+        Some(max) => match ActiveSlot::try_acquire(&state.active, &router_cfg.classifier, max) {
+            Some(slot) => Some(slot),
+            None => return (router_cfg.fallback_class.clone(), 0),
+        },
+        None => None,
+    };
     let timeout = Duration::from_secs(router_cfg.classifier_timeout_secs);
     let raw = serde_json::json!({"messages": [{"role": "user", "content": prompt}]});
     let start = Instant::now();
     let result = classifier.dispatch(&prompt, &raw, &state.env, timeout);
     let ms = start.elapsed().as_millis() as u64;
-    if cap.is_some() {
-        let mut active = state.active.lock().unwrap();
-        if let Some(c) = active.get_mut(&router_cfg.classifier) {
-            *c = c.saturating_sub(1);
-        }
-    }
     let class = match result {
         Ok(r) => parse_class(&r.content, &router_cfg.routes, &router_cfg.fallback_class),
         Err(_) => router_cfg.fallback_class.clone(),
@@ -907,5 +935,41 @@ mod tests {
             "execution"
         );
         assert_eq!(parse_class("nonsense", &routes, "execution"), "execution");
+    }
+
+    #[test]
+    fn active_slot_caps_and_frees() {
+        // U-20: the guard blocks a second acquire at cap and frees on Drop.
+        let active = Mutex::new(HashMap::new());
+        let s1 = ActiveSlot::try_acquire(&active, "b", 1);
+        assert!(s1.is_some(), "first acquire under cap succeeds");
+        assert_eq!(*active.lock().unwrap().get("b").unwrap(), 1);
+        assert!(
+            ActiveSlot::try_acquire(&active, "b", 1).is_none(),
+            "second acquire at cap is refused"
+        );
+        drop(s1);
+        assert_eq!(*active.lock().unwrap().get("b").unwrap(), 0);
+        assert!(
+            ActiveSlot::try_acquire(&active, "b", 1).is_some(),
+            "slot is reusable after Drop"
+        );
+    }
+
+    #[test]
+    fn active_slot_releases_on_unwind() {
+        // A2: a panic between acquire and release must not leak the slot (the
+        // server survives dispatch panics via F-3 catch_unwind).
+        let active = Mutex::new(HashMap::new());
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _slot = ActiveSlot::try_acquire(&active, "b", 1).unwrap();
+            panic!("boom");
+        }));
+        assert!(r.is_err());
+        assert_eq!(
+            *active.lock().unwrap().get("b").unwrap(),
+            0,
+            "slot must be freed after an unwind"
+        );
     }
 }
