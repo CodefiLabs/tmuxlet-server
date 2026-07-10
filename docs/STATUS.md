@@ -128,6 +128,14 @@ staying green; README, AGENTS.md, and `examples/server.toml` (now a commented
 reference block for every optional key, guarded by a lint-clean test) were brought
 up to date.
 
+**Optional polish (Phase E):** the discretionary items also landed — `Vary: Origin`
+on every response when CORS is enabled (cache correctness behind a shared proxy),
+de-duplicated the backend type-label and exec-bit helpers, typed the over-cap
+response as `ErrorKind::FileTooLarge` instead of matching English text, and
+dropped a double prompt-substitution in the CLI path. E5 (allocation micro-churn)
+and E7 (HEAD `Content-Length` / `WWW-Authenticate` RFC niceties) were left as the
+plan advised.
+
 ## Deferred to V2 (by spec, not bugs)
 
 - **True token streaming passthrough** (supersedes the current buffered SSE, which
