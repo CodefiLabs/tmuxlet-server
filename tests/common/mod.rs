@@ -86,6 +86,31 @@ pub fn post_collect(url: &str, body: &str) -> (u16, String, String) {
     }
 }
 
+/// POST a JSON body, returning (status, lowercased response-header map, body).
+/// For asserting response headers (e.g. x-tmuxlet-route, CORS) on chat requests.
+pub fn post_headers(
+    url: &str,
+    body: &str,
+) -> (u16, std::collections::HashMap<String, String>, String) {
+    let grab = |resp: ureq::Response| {
+        let mut hs = std::collections::HashMap::new();
+        for name in resp.headers_names() {
+            if let Some(v) = resp.header(&name) {
+                hs.insert(name.to_ascii_lowercase(), v.to_string());
+            }
+        }
+        (resp.status(), hs, resp.into_string().unwrap_or_default())
+    };
+    match agent()
+        .post(url)
+        .set("Content-Type", "application/json")
+        .send_string(body)
+    {
+        Ok(resp) => grab(resp),
+        Err(ureq::Error::Status(_code, resp)) => grab(resp),
+        Err(e) => panic!("POST {url} failed (transport error): {e}"),
+    }
+}
 /// Send an arbitrary method (HEAD, DELETE, ...); returns (status, Allow header, body).
 pub fn request(method: &str, url: &str) -> (u16, Option<String>, String) {
     let grab = |resp: ureq::Response| {

@@ -263,3 +263,54 @@ fn zero_workers_is_clamped_and_still_serves() {
     let (status, _) = common::get(&format!("{}/health", server.base));
     assert_eq!(status, 200, "clamped server must answer /health");
 }
+
+fn router_config(port: u16) -> String {
+    // A single-class router over /bin/echo. Whatever the classifier echoes,
+    // parse_class finds "only" (or falls back to it), so routing is deterministic:
+    // class "only" -> chain "default" -> winning backend "echo".
+    format!(
+        r#"
+[server]
+listen = "127.0.0.1:{port}"
+default_chain = "default"
+env_source = "process"
+
+[backends.echo]
+type = "cli"
+bin = "/bin/echo"
+
+[routers.smart]
+classifier = "echo"
+fallback_class = "only"
+routes = {{ only = "default" }}
+
+[chains.default]
+order = ["echo"]
+"#
+    )
+}
+
+#[test]
+fn route_header_names_the_winning_backend() {
+    // B1: x-tmuxlet-route is class/chain/backend — the third segment names the
+    // fallback leg that actually answered (unrecoverable from the body).
+    let server = common::start(&router_config(common::free_port()));
+    let (status, headers, body) = common::post_headers(
+        &format!("{}/v1/chat/completions", server.base),
+        r#"{"model":"smart","messages":[{"role":"user","content":"hi"}]}"#,
+    );
+    assert_eq!(status, 200, "body: {body}");
+    let route = headers
+        .get("x-tmuxlet-route")
+        .expect("x-tmuxlet-route must be present on a router request");
+    let segs: Vec<&str> = route.split('/').collect();
+    assert_eq!(
+        segs.len(),
+        3,
+        "route must be class/chain/backend, got '{route}'"
+    );
+    assert_eq!(
+        segs[2], "echo",
+        "third segment must name the winning backend: '{route}'"
+    );
+}

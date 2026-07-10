@@ -377,8 +377,32 @@ fn respond_backends(req: Request, state: &Arc<State>) {
     respond_json(req, 200, serde_json::to_string(&entries).unwrap());
 }
 
+/// B3/U-8: one closing info line per chat request — success OR total failure.
+/// status: ok = first candidate answered, fallback = a later one did, fail = none.
+fn log_request_summary(
+    reqid: &str,
+    model: &str,
+    route_label: Option<&str>,
+    elapsed_ms: u64,
+    winner: Option<&str>,
+    first: Option<&str>,
+) {
+    let status = if winner.is_none() {
+        "fail"
+    } else if winner == first {
+        "ok"
+    } else {
+        "fallback"
+    };
+    log::info(&format!(
+        "{reqid} model={model} route={} elapsed_ms={elapsed_ms} backend={} status={status}",
+        route_label.unwrap_or("-"),
+        winner.unwrap_or("-"),
+    ));
+}
 fn handle_chat(req: Request, raw: &str, state: &Arc<State>) {
     let reqid = log::next_reqid();
+    let req_start = Instant::now();
     // P-2: parse the body once to a Value, then deserialize the typed view.
     let raw_value: serde_json::Value = match serde_json::from_str(raw) {
         Ok(v) => v,
@@ -427,7 +451,7 @@ fn handle_chat(req: Request, raw: &str, state: &Arc<State>) {
             Err(e) => return respond_err(req, 500, &e, "server_error", Some("router_error")),
         };
         log::info(&format!(
-            "{reqid} route auto class={class} target={target} classifier_ms={classifier_ms}"
+            "{reqid} route {model} class={class} target={target} classifier_ms={classifier_ms}"
         ));
         (names, Some(format!("{class}/{target}")))
     } else {
@@ -466,15 +490,26 @@ fn handle_chat(req: Request, raw: &str, state: &Arc<State>) {
             default_to,
             route_label,
             reqid,
+            req_start,
+            model,
         );
         return;
     }
 
     let names_ref: Vec<&str> = names_owned.iter().map(|s| s.as_str()).collect();
+    let first = names_owned.first().map(|s| s.as_str());
     match run_chain(
         state, &names_ref, &prompt, &last_user, &raw_value, default_to, &reqid,
     ) {
-        Ok(result) => {
+        Ok((result, winner)) => {
+            log_request_summary(
+                &reqid,
+                &model,
+                route_label.as_deref(),
+                req_start.elapsed().as_millis() as u64,
+                Some(&winner),
+                first,
+            );
             let id = format!("chatcmpl-{}", result.model_label);
             let body = serde_json::to_string(&openai::build_completion(
                 id,
@@ -486,11 +521,22 @@ fn handle_chat(req: Request, raw: &str, state: &Arc<State>) {
                 .with_header(header("Content-Type", "application/json"))
                 .with_status_code(StatusCode(200));
             if let Some(rl) = &route_label {
-                resp = resp.with_header(header("x-tmuxlet-route", rl));
+                // B1: append the winning backend — the full class/chain/backend.
+                resp = resp.with_header(header("x-tmuxlet-route", &format!("{rl}/{winner}")));
             }
             let _ = req.respond(apply_cors(resp));
         }
-        Err(errors) => respond_json(req, 503, build_503_body(&errors, state.redact_errors)),
+        Err(errors) => {
+            log_request_summary(
+                &reqid,
+                &model,
+                route_label.as_deref(),
+                req_start.elapsed().as_millis() as u64,
+                None,
+                first,
+            );
+            respond_json(req, 503, build_503_body(&errors, state.redact_errors));
+        }
     }
 }
 
@@ -500,9 +546,12 @@ fn handle_chat(req: Request, raw: &str, state: &Arc<State>) {
 /// error, no `data: [DONE]`, indistinguishable from an empty success. The server
 /// is built to survive dispatch panics (F-3), so map them to the same 503 body
 /// the non-streaming path returns.
-fn dispatch_or_panic_error<F>(reqid: &str, f: F) -> Result<DispatchResult, Vec<BackendError>>
+fn dispatch_or_panic_error<F>(
+    reqid: &str,
+    f: F,
+) -> Result<(DispatchResult, String), Vec<BackendError>>
 where
-    F: FnOnce() -> Result<DispatchResult, Vec<BackendError>>,
+    F: FnOnce() -> Result<(DispatchResult, String), Vec<BackendError>>,
 {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
         Ok(r) => r,
@@ -530,12 +579,15 @@ fn stream_with_keepalive(
     default_to: Duration,
     route_label: Option<String>,
     reqid: String,
+    req_start: Instant,
+    model: String,
 ) {
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
-    let (rtx, rrx) = mpsc::channel::<Result<DispatchResult, Vec<BackendError>>>();
+    let (rtx, rrx) = mpsc::channel::<Result<(DispatchResult, String), Vec<BackendError>>>();
     let redact = state.redact_errors;
     let state_dispatch = Arc::clone(state);
     let reqid2 = reqid.clone();
+    let first = names.first().cloned();
     std::thread::spawn(move || {
         let names_ref: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
         let r = dispatch_or_panic_error(&reqid2, || {
@@ -551,6 +603,7 @@ fn stream_with_keepalive(
         });
         let _ = rtx.send(r);
     });
+    let route_for_log = route_label.clone();
     std::thread::spawn(move || {
         let final_result = loop {
             match rrx.recv_timeout(Duration::from_secs(15)) {
@@ -563,8 +616,17 @@ fn stream_with_keepalive(
                 Err(mpsc::RecvTimeoutError::Disconnected) => return,
             }
         };
+        let elapsed_ms = req_start.elapsed().as_millis() as u64;
         match final_result {
-            Ok(result) => {
+            Ok((result, winner)) => {
+                log_request_summary(
+                    &reqid,
+                    &model,
+                    route_for_log.as_deref(),
+                    elapsed_ms,
+                    Some(&winner),
+                    first.as_deref(),
+                );
                 let id = format!("chatcmpl-{}", result.model_label);
                 for f in openai::stream_frames(&id, &result.model_label, &result.content) {
                     if tx.send(f.into_bytes()).is_err() {
@@ -573,6 +635,14 @@ fn stream_with_keepalive(
                 }
             }
             Err(errors) => {
+                log_request_summary(
+                    &reqid,
+                    &model,
+                    route_for_log.as_deref(),
+                    elapsed_ms,
+                    None,
+                    first.as_deref(),
+                );
                 let body = build_503_body(&errors, redact);
                 let _ = tx.send(format!("data: {body}\n\n").into_bytes());
                 let _ = tx.send(b"data: [DONE]\n\n".to_vec());
@@ -610,7 +680,7 @@ fn run_chain(
     raw_value: &serde_json::Value,
     default_to: Duration,
     reqid: &str,
-) -> Result<DispatchResult, Vec<BackendError>> {
+) -> Result<(DispatchResult, String), Vec<BackendError>> {
     let cooldown_on = state.cfg.server.cooldown;
     let start = Instant::now();
     let budget_deadline = state
@@ -699,7 +769,7 @@ fn run_chain(
                 log::info(&format!(
                     "{reqid} ok backend={name} elapsed_ms={elapsed_ms}"
                 ));
-                return Ok(res);
+                return Ok((res, name.to_string()));
             }
             Err(e) => {
                 log::warn(&format!("{reqid} skip backend={name}: {e}"));
