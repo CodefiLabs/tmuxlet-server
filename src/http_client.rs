@@ -361,4 +361,18 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn tls_config_with_a_valid_ca_parses_and_caches() {
+        // U-24 happy path: a committed, offline-generated self-signed CA PEM
+        // parses, and a second call for the same path hits the cache (same Arc).
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/test-ca.pem");
+        let first = tls_config_for(Some(&path)).expect("a valid CA PEM must parse");
+        let second = tls_config_for(Some(&path)).expect("second call must succeed");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "the second call must return the cached config, not re-parse"
+        );
+    }
 }
