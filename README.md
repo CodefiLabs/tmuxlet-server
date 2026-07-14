@@ -4,7 +4,7 @@ A single static Rust binary that exposes an **OpenAI-compatible
 `/v1/chat/completions`** endpoint backed by a configurable fallback chain of
 heterogeneous AI backends:
 
-- **`tmuxlet`** — interactive coding CLIs (claude, codex, gemini, …) run through
+- **`tmuxlet`** — interactive coding CLIs (claude, codex, grok, …) run through
   [`tmuxlet`](https://github.com/CodefiLabs/tmuxlet).
 - **`cli`** — arbitrary CLI tools, optionally in a PTY (for tools like `agy`
   that detect a non-TTY and redirect output). Use the `{prompt}` placeholder in
