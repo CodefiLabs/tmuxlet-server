@@ -1,7 +1,7 @@
 # Phase 0 implementation plan — correctness
 
-**Status:** ready to implement
-**Date:** 2026-08-11
+**Status:** ready to implement — O1 and O5 settled 2026-08-12, no open questions remain
+**Date:** 2026-08-11 (decisions applied 2026-08-12)
 **Spec:** [`docs/specs/2026-08-11-v2-routing-architecture.md`](../specs/2026-08-11-v2-routing-architecture.md) §4 (Phase 0 only)
 **Branch this plan was written on:** `plan/phase-0-correctness` (docs only; nothing under `src/` touched)
 
@@ -233,7 +233,7 @@ private and each has exactly one call site.
   **Recommended addition (small, not in the spec):** when the opening message is
   shorter than `head_budget`, hand the unused remainder to the tail rather than
   discarding it. Two lines, strictly more signal, never exceeds `max`. Flagged
-  in §6 as O2 in case a reviewer wants the fixed split instead.
+  in §7 as O2 in case a reviewer wants the fixed split instead.
 
 - **`classify_task`** signature changes from `last_user: &str` to
   `messages: &[openai::ChatMessage]`, and `src/http.rs:899` becomes:
@@ -242,9 +242,13 @@ private and each has exactly one call site.
   let truncated = classifier_input(
       messages,
       router_cfg.classifier_max_chars,
-      router_cfg.classifier_include_opening,
+      state.cfg.server.classifier_include_opening,
   );
   ```
+
+  Note the flag comes off `state.cfg.server`, not `router_cfg` — it is
+  server-wide (O5). `classify_task` already takes `state: &State`, so this needs
+  no new parameter and no plumbing. See §3.
 
   Everything downstream (`{input}` substitution in `classifier_prompt`, the
   default prompt at `:903`) is unchanged — it already consumes a `String`.
@@ -275,7 +279,7 @@ change in `src/openai.rs`.
   is thrown away — and that detail is what makes the new 400 body actionable
   ("maximum context length is 32768 tokens, requested 41002"). Two fields match
   the shape of the neighbouring `Http(name, status, detail)` and cost nothing.
-  Flagged as O3 in §6 if a reviewer prefers the literal spec form.
+  Flagged as O3 in §7 if a reviewer prefers the literal spec form.
 
 - `backend_name()` (`:52`) gains `Overflow(n, _) => n` in the existing or-pattern.
 - `class()` (`:65`) gains `Overflow(_, _) => "context overflow"`.
@@ -365,8 +369,7 @@ change in `src/openai.rs`.
 same `errors` vec. Under the strict `all(...)` rule, a chain where one leg
 overflowed and another was skipped as cooling returns 503, not 400. That is the
 conservative reading of "when every leg overflows" and it is what the plan
-implements — but see O1 in §6, it is worth thirty seconds of a reviewer's
-attention.
+implements. **Confirmed as the decision** — see O1 in §7.
 
 ---
 
@@ -374,58 +377,70 @@ attention.
 
 One new key: `classifier_include_opening`.
 
-**Home: `[routers.<name>]`, not `[server]`.** Its sibling
-`classifier_max_chars` is already a `Router` field, the value is meaningful per
-router (a `do` router over agent traffic wants it on; a one-shot `improve`
-router barely cares), and the whole §5 classifier surface lives there. See O5 if
-a reviewer wants it server-wide.
+**Home: `[server]`, not `[routers.<name>]`** (O5, decided 2026-08-12). The key
+exists to let an operator pin v0.2.0 classifier behavior once for a whole
+server; a per-router home would mean editing five router tables in
+`examples/server-router-framework.toml` to do it. It is the only classifier key
+living outside `[routers.<name>]` — that asymmetry is deliberate and needs a
+comment at the declaration, because the neighbouring `classifier_max_chars`
+*is* per-router.
 
-Four edits:
+Three edits:
 
-1. **`src/config.rs:106-121`** — add to `struct Router`:
+1. **`src/config.rs:22-70`** — add to `struct Server`, after `cors_origins`:
 
    ```rust
-   /// §4.2: include the opening user task in the classifier input, not just the
-   /// latest turn. Opt-out; set false to pin v0.2.0 behavior.
+   /// §4.2: include the opening user task in the classifier input, not just
+   /// the latest turn. Server-wide — unlike the per-router `classifier_*`
+   /// keys — so one line pins v0.2.0 behavior for every router. Opt-out.
    #[serde(default = "default_true")]
    pub classifier_include_opening: bool,
    ```
 
-   `default_true` already exists at `src/config.rs:87` — reuse it, do not add a
-   `default_classifier_include_opening`.
+   `default_true` already exists at `src/config.rs:87` **and is already used by
+   `Server::cooldown` at `:58`**, so this is an established pattern in this exact
+   struct. Reuse it; do not add a `default_classifier_include_opening`.
 
-2. **`src/config.rs:477-484`** — add `"classifier_include_opening"` to
-   `ROUTER_KEYS`. Without this, U-4 unknown-key linting rejects the key as a
-   typo and `--validate` fails on any config that sets it. This is the single
-   easiest step to forget; it has its own test (T8).
+2. **`src/config.rs:424-441`** — add `"classifier_include_opening"` to
+   `SERVER_KEYS` (**not** `ROUTER_KEYS`). Without this, the unknown-key lint at
+   `src/config.rs:502` reports it as `server.classifier_include_opening` with a
+   "did you mean" suggestion, and `--validate` fails on any config that sets it.
+   This is the single easiest step to forget; it has its own test (T11).
 
 3. **`validate()`** (`src/config.rs:255-283`) — **no change**. A `bool` has no
    invalid value and no cross-reference to check.
 
-4. **Threading to the call site** — one hop, no plumbing:
-   `handle_chat` already holds `router_cfg: &config::Router` (`src/http.rs:468`)
-   and passes it whole into `classify_task`, which reads
-   `router_cfg.classifier_include_opening` directly.
+**Threading: none required — this is where server-wide is cheaper than
+per-router.** `classify_task` already receives `state: &State`
+(`src/http.rs:892-896`), and `state.cfg.server` is reachable from it — the same
+access `handle_chat` already makes for `state.cfg.server.strict_models`
+(`src/http.rs:487`). The per-router variant would have read the flag off
+`router_cfg`; server-wide reads it off `state.cfg.server` at the same call site.
+No signature change beyond the `last_user: &str` → `messages: &[ChatMessage]`
+swap §2.2 already makes.
 
 **Example configs.** One file needs an edit:
 
-- **`examples/server.toml:114`** — the `[routers.smart]` comment block documents
-  every classifier key. Add a line beside it, and fix the now-misleading
-  description of `classifier_max_chars`:
+- **`examples/server.toml:4-12`** — document the key in the `[server]` block,
+  where an operator looking to pin behavior will actually go:
 
   ```toml
-  #   classifier_max_chars = 4000     # total budget for the classifier input
-  #   classifier_include_opening = true  # §4.2: show the classifier the opening
-  #                                   # task + the latest turn (60/40 split), not
-  #                                   # just the latest turn. false = v0.2.0 behavior.
+  # classifier_include_opening = true  # §4.2: show the classifier the opening
+  #                                    # task + the latest turn (60/40 split),
+  #                                    # not just the latest turn. Server-wide;
+  #                                    # false = v0.2.0 behavior.
   ```
 
-- **`examples/server-router-framework.toml`** — **no edit needed.** Its five
-  routers (`:130`, `:142`, `:155`, `:167`, `:180`) set only `classifier`,
-  `fallback_class`, and `routes`; they inherit the `true` default, which is the
-  intended behavior for exactly the agent traffic that file targets. Both example
-  files are asserted parseable+valid by the `config.rs` tests, so a stray key
-  there would fail CI immediately.
+  Separately, fix the now-misleading description of `classifier_max_chars` in
+  the `[routers.smart]` comment block (`examples/server.toml:114`) — it is now a
+  budget over the *combined* classifier input, not over the latest turn alone.
+
+- **`examples/server-router-framework.toml`** — **no edit needed.** Its
+  `[server]` block (`:39-47`) already defers to `examples/server.toml` for "the
+  full reference block of optional keys", and its five routers inherit the `true`
+  default, which is the intended behavior for exactly the agent traffic that file
+  targets. Both example files are asserted parseable+valid by the `config.rs`
+  tests, so a stray key there would fail CI immediately.
 
 - **`README.md`** — no edit. It does not document individual classifier keys
   (only `README.md:86` mentions the auto-router at all).
@@ -441,7 +456,7 @@ why the spec makes it opt-out rather than silent.
 
 ## 4. Test list
 
-17 tests, T1–T17. The spec estimates ~14; the three extra are the `ROUTER_KEYS`
+17 tests, T1–T17. The spec estimates ~14; the three extra are the `SERVER_KEYS`
 lint test (T11, cheap insurance against the easiest-to-forget edit), the
 mixed-failure 503 pin (T16), and the streaming overflow-body test (T17, which
 covers a path the spec's §4.3 does not mention).
@@ -474,7 +489,7 @@ single-class router harness at `tests/routes.rs:278-302` to copy.
 
 | # | Name | Asserts |
 |---|---|---|
-| T11 | `classifier_include_opening_defaults_true_and_lints_clean` | A `[routers.x]` omitting the key parses with `classifier_include_opening == true`; a config *setting* it to `false` parses to `false` **and** produces no `lint()` output. The second half is the `ROUTER_KEYS` regression guard (§3 edit 2). |
+| T11 | `classifier_include_opening_defaults_true_and_lints_clean` | Three cases. (a) A `[server]` block omitting the key parses with `classifier_include_opening == true`. (b) A `[server]` block *setting* it to `false` parses to `false` **and** produces no `lint()` output — the `SERVER_KEYS` regression guard (§3 edit 2). (c) The key under `[routers.x]` **does** lint, as an unknown router key. Case (c) pins the server-wide home (O5) against a future well-meaning move back to per-router, which would otherwise silently ignore the operator's `[server]` setting. |
 
 ### §4.3 — overflow (unit)
 
@@ -542,7 +557,7 @@ and `cargo test` all green, with the test count at **146** (129 baseline + 17).
 |---|---|
 | §4.1 `parse_class` rewrite + `DecisionSource` + log line | ~35 |
 | §4.2 `classifier_input` + `truncate_head` + `classify_task` signature + call site | ~55 |
-| §4.2 config key + `ROUTER_KEYS` + example comment | ~8 |
+| §4.2 config key + `SERVER_KEYS` + example comment | ~8 |
 | §4.3 `Overflow` variant + `class`/`Display`/`backend_name` + `is_context_overflow` | ~30 |
 | §4.3 `api.rs` detection hookup | ~6 |
 | §4.3 `record_overflow` + `record_failure` short-circuit | ~18 |
@@ -558,37 +573,43 @@ the config key needed no `validate()` logic.
 
 ## 7. Risks and open questions
 
-Ordered by how much a wrong answer costs. **O1 and O5 are worth a human's call
-before implementation starts**; the rest are judgment calls this plan has already
-made and merely records.
+Ordered by how much a wrong answer costs. **O1 and O5 were open when this plan
+was first written; both were decided on 2026-08-12 and are recorded below as
+settled.** The rest are judgment calls this plan has already made and merely
+records.
 
-### Decisions worth confirming first
+### Decisions settled
 
-**O1 — What exactly is "every leg overflows"?**
+**O1 — What exactly is "every leg overflows"? → STRICT.** *(decided 2026-08-12)*
 `run_chain` mixes real dispatch errors with synthetic skip markers
 (`"skipped: cooling Ns"`, `"skipped: budget"`) and `Busy` in one `errors` vec.
 Under the strict `all(...)` rule this plan implements, a chain where leg 1
 overflowed and leg 2 was skipped as cooling returns **503**, not 400 — even
 though nothing that actually ran could serve the prompt. The looser rule (at
 least one `Overflow`, no non-overflow *dispatch* failure) returns 400 there.
-Strict is the safer default — a wrong 400 tells a client "your request is
-unservable, do not retry" when a retry in 60s would in fact work — but the
-looser rule is arguably what a user experiences as correct. **Recommendation:**
-ship strict, keep T16 as the pin, revisit if it shows up in practice.
-*Cost of getting it wrong: a spurious retry, or a spurious no-retry. Low either
-way, but it is a semantic choice, not an implementation detail.*
+**Strict wins:** a wrong 400 tells a client "your request is unservable, do not
+retry" when a retry in 60s would in fact work. T16 pins the rule, so a later
+drift to "any overflow → 400" has to break a test to happen. Revisit only if the
+mixed case shows up in practice.
 
-**O5 — Is `classifier_include_opening` per-router or server-wide?**
-This plan puts it in `[routers.<name>]` (§3). Server-wide would mean one line in
-`[server]` for an operator who wants to pin v0.2.0 behavior globally rather than
-editing five router tables in
-`examples/server-router-framework.toml`. Per-router matches where every other
-classifier key lives and is strictly more expressive; server-wide is more
-ergonomic for the one use case the key exists to serve. A `[server]` default
-that routers override is the third option and costs ~10 extra LOC.
-**Recommendation:** per-router. **But this is the one decision that is annoying
-to reverse** once configs in the wild set it.
+**O5 — Is `classifier_include_opening` per-router or server-wide? → SERVER-WIDE.**
+*(decided 2026-08-12)* A tmuxlet server's chain is configured once and is meant
+to apply to every session; the flag governing what the classifier is shown
+should follow the same shape. One line in `[server]` pins v0.2.0 behavior
+globally, rather than five edits across the router tables in
+`examples/server-router-framework.toml`. §2.2 and §3 are written to this
+decision.
 
+Consequences accepted:
+
+- It is the only classifier key living outside `[routers.<name>]`. Comment the
+  asymmetry at the declaration — the neighbouring `classifier_max_chars` *is*
+  per-router, and the next person to read the struct will assume this one is too.
+- Per-router variation is no longer expressible. If it is ever wanted, the
+  `[server]`-default-plus-router-override variant (~10 LOC) remains **strictly
+  additive**: a router key that defaults to "inherit the server value" cannot
+  break a config written against server-wide. So this is no longer the
+  hard-to-reverse decision the original draft flagged it as.
 ### Judgment calls already made (recorded, not blocking)
 
 **O2 — Fixed 60/40, or redistribute the unused head budget?**
